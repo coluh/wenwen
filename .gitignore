@@ -1,0 +1,8 @@
+Qwen25
+*.out
+*/**/*.o
+build/
+
+.*
+!.gitignore
+!.clangd

@@ -1,0 +1,238 @@
+#include "tokenizer.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static char* read_file(const char* filename) {
+	FILE* fp = fopen(filename, "rb");
+	if (!fp) {
+		printf("ERROR: no file %s\n", filename);
+	}
+
+	fseek(fp, 0, SEEK_END);
+	long size = ftell(fp);
+	rewind(fp);
+
+	char* buffer = malloc(size + 1);
+	fread(buffer, 1, size, fp);
+	buffer[size] = '\0';
+	fclose(fp);
+
+	return buffer;
+}
+
+static VocabItem* read_vocabs(const char* vocab_json, int* out_n) {
+	int cap           = 256;
+	VocabItem* vocabs = malloc(cap * sizeof(VocabItem));
+	int n_vocabs      = 0;
+
+	char* content = read_file(vocab_json);
+	char* p       = content;
+	while (*p) {
+		while (*p && *p != '"') {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+
+		char* token_start = ++p;
+		while (*p != '"') {
+			if (*p == '\\') {
+				p++;
+			}
+			p++;
+		}
+		char* const token = calloc(p - token_start + 1, 1);
+		char* q           = token;
+		while (*token_start != '"') {
+			if (*token_start == '\\') {
+				token_start++;
+			}
+			*q++ = *token_start++;
+		}
+		*q = '\0';
+
+		while (*p != ':') {
+			p++;
+		}
+		p++;
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		int id = 0;
+		while (*p >= '0' && *p <= '9') {
+			id = id * 10 + (*p - '0');
+			p++;
+		}
+
+		vocabs[n_vocabs] = (VocabItem){token, id};
+		n_vocabs++;
+		if (n_vocabs >= cap) {
+			cap *= 2;
+			vocabs = realloc(vocabs, cap * sizeof(VocabItem));
+		}
+	}
+	free(content);
+
+	*out_n = n_vocabs;
+	return vocabs;
+}
+
+static MergeRule* read_merges(const char* merges_txt, int* out_n) {
+	int cap          = 256;
+	MergeRule* rules = malloc(cap * sizeof(MergeRule));
+	int n_rules      = 0;
+
+	char* content = read_file(merges_txt);
+	char* p       = content;
+	while (*p) {
+		while (*p && (*p == '\n' || *p == '\r')) {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+
+		const char* start1 = p;
+		while (*p != ' ' && *p != '\t') {
+			p++;
+		}
+		int len1     = p - start1;
+		char* token1 = calloc(len1 + 1, 1);
+		memcpy(token1, start1, len1);
+
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		const char* start2 = p;
+		while (*p != ' ' && *p != '\t' && *p != '\n') {
+			p++;
+		}
+		int len2     = p - start2;
+		char* token2 = calloc(len2 + 1, 1);
+		memcpy(token2, start2, len2);
+
+		rules[n_rules] = (MergeRule){token1, token2};
+		n_rules++;
+		if (n_rules >= cap) {
+			cap *= 2;
+			rules = realloc(rules, cap * sizeof(MergeRule));
+		}
+	}
+	free(content);
+
+	*out_n = n_rules;
+	return rules;
+}
+
+Tokenizer new_tokenizer(const char* vocab_json, const char* merges_txt) {
+	Tokenizer t;
+	t.vocabs = read_vocabs(vocab_json, &t.n_vocabs);
+	t.merges = read_merges(merges_txt, &t.n_merges);
+	return t;
+}
+
+static const char* bytes_to_unicode(char b_char) {
+	static char u[3];
+	memset(u, 0, 3);
+
+	int b = (int)(unsigned char)b_char;
+	int c;
+
+	if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255)) {
+		c = b;
+	} else {
+		if (b < 33) {
+			c = 256 + b; // 0 256, 32 288
+		} else if (b < 161) {
+			c = 256 + 32 + b - 126; // 127 289, 160 322
+		} else {
+			c = 256 + 32 + 161 - 126; // 173 323
+		}
+	}
+
+	if (c < 0b10000000) {
+		// 0b 01111111
+		u[0] = c;
+	} else if (c < 2048) {
+		// 0b 11011111 10111111
+		u[0] = 0b11000000 | (c >> 6);
+		u[1] = 0b10000000 | (c & 0b00111111);
+	}
+
+	return u;
+}
+
+// create a cute cat
+static char* new_cat(const char* s1, const char* s2) {
+	char* s = malloc(strlen(s1) + strlen(s2) + 1);
+	memcpy(s, s1, strlen(s1));
+	memcpy(s + strlen(s1), s2, strlen(s2));
+	s[strlen(s1) + strlen(s2)] = '\0';
+	return s;
+}
+
+int* tokenize(Tokenizer tokenizer, const char* input, int* out_n) {
+	int n         = strlen(input);
+	char** tokens = malloc(n * sizeof(char*));
+
+	// input raw bytes as id, map to string
+	for (int i = 0; i < n; i++) {
+		// this is wrong
+		// const char* p =
+		//     id_to_s(tokenizer.vocabs, tokenizer.n_vocabs, (unsigned char)input[i]);
+
+		// this is right
+		const char* p = bytes_to_unicode(input[i]);
+		tokens[i]     = strdup(p);
+	}
+
+	// merge token string
+	for (int m = 0; m < tokenizer.n_merges; m++) {
+		MergeRule* rule = &tokenizer.merges[m];
+		while (1) {
+			int has_combine = 0;
+			int i           = 0;
+			while (i < n - 1) {
+				if ((strcmp(tokens[i], rule->s1) == 0) &&
+				    (strcmp(tokens[i + 1], rule->s2) == 0)) {
+					free(tokens[i]);
+					free(tokens[i + 1]);
+					tokens[i] = new_cat(rule->s1, rule->s2);
+					for (int j = i + 1; j < n - 1; j++) {
+						tokens[j] = tokens[j + 1];
+					}
+					has_combine = 1;
+					n--;
+				} else {
+					i++;
+				}
+			}
+			if (!has_combine) {
+				break;
+			}
+		}
+	}
+
+	int* ids = malloc(n * sizeof(int));
+	for (int i = 0; i < n; i++) {
+		ids[i] = -1;
+		for (int j = 0; j < tokenizer.n_vocabs; j++) {
+			if (strcmp(tokens[i], tokenizer.vocabs[j].s) == 0) {
+				ids[i] = tokenizer.vocabs[j].id;
+			}
+		}
+	}
+
+	for (int i = 0; i < n; i++) {
+		if (tokens[i]) {
+			free(tokens[i]);
+		}
+	}
+	free(tokens);
+
+	*out_n = n;
+	return ids;
+}
