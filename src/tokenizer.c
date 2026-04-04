@@ -23,12 +23,12 @@ static char* read_file(const char* filename) {
 }
 
 static VocabItem* read_vocabs(const char* vocab_json, int* out_n) {
-	int cap           = 256;
+	int cap = 256;
 	VocabItem* vocabs = malloc(cap * sizeof(VocabItem));
-	int n_vocabs      = 0;
+	int n_vocabs = 0;
 
 	char* content = read_file(vocab_json);
-	char* p       = content;
+	char* p = content;
 	while (*p) {
 		while (*p && *p != '"') {
 			p++;
@@ -45,7 +45,7 @@ static VocabItem* read_vocabs(const char* vocab_json, int* out_n) {
 			p++;
 		}
 		char* const token = calloc(p - token_start + 1, 1);
-		char* q           = token;
+		char* q = token;
 		while (*token_start != '"') {
 			if (*token_start == '\\') {
 				token_start++;
@@ -81,12 +81,12 @@ static VocabItem* read_vocabs(const char* vocab_json, int* out_n) {
 }
 
 static MergeRule* read_merges(const char* merges_txt, int* out_n) {
-	int cap          = 256;
+	int cap = 256;
 	MergeRule* rules = malloc(cap * sizeof(MergeRule));
-	int n_rules      = 0;
+	int n_rules = 0;
 
 	char* content = read_file(merges_txt);
-	char* p       = content;
+	char* p = content;
 	while (*p) {
 		while (*p && (*p == '\n' || *p == '\r')) {
 			p++;
@@ -99,7 +99,7 @@ static MergeRule* read_merges(const char* merges_txt, int* out_n) {
 		while (*p != ' ' && *p != '\t') {
 			p++;
 		}
-		int len1     = p - start1;
+		int len1 = p - start1;
 		char* token1 = calloc(len1 + 1, 1);
 		memcpy(token1, start1, len1);
 
@@ -110,7 +110,7 @@ static MergeRule* read_merges(const char* merges_txt, int* out_n) {
 		while (*p != ' ' && *p != '\t' && *p != '\n') {
 			p++;
 		}
-		int len2     = p - start2;
+		int len2 = p - start2;
 		char* token2 = calloc(len2 + 1, 1);
 		memcpy(token2, start2, len2);
 
@@ -134,6 +134,18 @@ Tokenizer new_tokenizer(const char* vocab_json, const char* merges_txt) {
 	return t;
 }
 
+void free_tokenizer(Tokenizer t) {
+	for (int i = 0; i < t.n_vocabs; i++) {
+		free(t.vocabs[i].s);
+	}
+	for (int i = 0; i < t.n_merges; i++) {
+		free(t.merges[i].s1);
+		free(t.merges[i].s2);
+	}
+	free(t.vocabs);
+	free(t.merges);
+}
+
 static const char* bytes_to_unicode(char b_char) {
 	static char u[3];
 	memset(u, 0, 3);
@@ -145,11 +157,11 @@ static const char* bytes_to_unicode(char b_char) {
 		c = b;
 	} else {
 		if (b < 33) {
-			c = 256 + b; // 0 256, 32 288
+			c = 256 + b;  // 0 256, 32 288
 		} else if (b < 161) {
-			c = 256 + 32 + b - 126; // 127 289, 160 322
+			c = 256 + 32 + b - 126;	 // 127 289, 160 322
 		} else {
-			c = 256 + 32 + 161 - 126; // 173 323
+			c = 256 + 32 + 161 - 126;  // 173 323
 		}
 	}
 
@@ -175,7 +187,7 @@ static char* new_cat(const char* s1, const char* s2) {
 }
 
 int* tokenize(Tokenizer tokenizer, const char* input, int* out_n) {
-	int n         = strlen(input);
+	int n = strlen(input);
 	char** tokens = malloc(n * sizeof(char*));
 
 	// input raw bytes as id, map to string
@@ -186,7 +198,7 @@ int* tokenize(Tokenizer tokenizer, const char* input, int* out_n) {
 
 		// this is right
 		const char* p = bytes_to_unicode(input[i]);
-		tokens[i]     = strdup(p);
+		tokens[i] = strdup(p);
 	}
 
 	// merge token string
@@ -194,10 +206,9 @@ int* tokenize(Tokenizer tokenizer, const char* input, int* out_n) {
 		MergeRule* rule = &tokenizer.merges[m];
 		while (1) {
 			int has_combine = 0;
-			int i           = 0;
+			int i = 0;
 			while (i < n - 1) {
-				if ((strcmp(tokens[i], rule->s1) == 0) &&
-				    (strcmp(tokens[i + 1], rule->s2) == 0)) {
+				if ((strcmp(tokens[i], rule->s1) == 0) && (strcmp(tokens[i + 1], rule->s2) == 0)) {
 					free(tokens[i]);
 					free(tokens[i + 1]);
 					tokens[i] = new_cat(rule->s1, rule->s2);
@@ -227,12 +238,19 @@ int* tokenize(Tokenizer tokenizer, const char* input, int* out_n) {
 	}
 
 	for (int i = 0; i < n; i++) {
-		if (tokens[i]) {
-			free(tokens[i]);
-		}
+		free(tokens[i]);
 	}
 	free(tokens);
 
 	*out_n = n;
 	return ids;
+}
+
+const char *get_word(Tokenizer tokenizer, int token) {
+	for (int i = 0; i < tokenizer.n_vocabs; i++) {
+		if (tokenizer.vocabs[i].id == token) {
+			return tokenizer.vocabs[i].s;
+		}
+	}
+	return "unknown";
 }
