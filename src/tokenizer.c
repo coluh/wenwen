@@ -191,6 +191,7 @@ int* tokenize(Tokenizer tokenizer, const char* input, int* out_n) {
 	char** tokens = malloc(n * sizeof(char*));
 
 	// input raw bytes as id, map to string
+	// raw bytes of input -> each byte to a unicode/utf-8 string of one unicode
 	for (int i = 0; i < n; i++) {
 		// this is wrong
 		// const char* p =
@@ -246,10 +247,15 @@ int* tokenize(Tokenizer tokenizer, const char* input, int* out_n) {
 	return ids;
 }
 
+// FIXME:
+// should do:
+// 	concat token strings
+// 	per unicode map to byte
+// 	decode as utf-8
 const char *get_word(Tokenizer tokenizer, int token) {
 	for (int i = 0; i < tokenizer.n_vocabs; i++) {
 		if (tokenizer.vocabs[i].id == token) {
-			return tokenizer.vocabs[i].s;
+			const char *s = tokenizer.vocabs[i].s;
 		}
 	}
 	return "unknown";

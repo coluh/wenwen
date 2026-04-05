@@ -1,5 +1,6 @@
 Qwen25
 main.py
+*.bin
 *.out
 */**/*.o
 build/
