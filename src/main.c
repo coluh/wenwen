@@ -24,10 +24,36 @@ int main() {
 
 	ModelConfig* config = read_config("./Qwen25/config.json");
 	void* model = Qwen25_05B(config, "./Qwen25/model.safetensors");
-	int token = Qwen25_05B_inference(model, tokens, n);
-	printf("next token: %d\n", token);
-	printf("output: %s\n", get_word(t, token));
 
+	int cap = 32;
+	int *outputs = malloc(cap*sizeof(int));
+	int i = 0;
+	while (1) {
+		printf("\r %d / %d", i+1, 128);
+		fflush(stdout);
+		int token = Qwen25_05B_inference(model, tokens, n);
+		if (token == config->eos_token_id || i == 128) {
+			break;
+		}
+
+		n++;
+		tokens = realloc(tokens, n*sizeof(int));
+		tokens[n-1] = token;
+
+		outputs[i] = token;
+		i++;
+		if (i >= cap) {
+			cap *= 2;
+			outputs = realloc(outputs, cap*sizeof(int));
+		}
+	}
+	printf("\n");
+
+	char *output = decode(t, outputs, i);
+	printf("output: %s\n", output);
+
+	free(output);
+	free(outputs);
 	Qwen25_05B_free(model);
 	free(config);
 	free(tokens);

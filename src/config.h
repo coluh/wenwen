@@ -4,6 +4,7 @@
 #include <stdlib.h>
 typedef struct ModelConfig {
 	int vocab_size;
+	int eos_token_id;
 	int hidden_size;
 	int num_layers;
 	float rms_norm_eps;
@@ -16,6 +17,7 @@ typedef struct ModelConfig {
 static inline ModelConfig* read_config(const char* config_json) {
 	ModelConfig* c = malloc(sizeof(struct ModelConfig));
 	c->vocab_size = 151936;
+	c->eos_token_id = 151643;
 	c->hidden_size = 896;
 	c->num_layers = 24;
 	c->rms_norm_eps = 1e-6f;

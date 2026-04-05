@@ -1,5 +1,6 @@
 #include "tokenizer.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,16 +248,60 @@ int* tokenize(Tokenizer tokenizer, const char* input, int* out_n) {
 	return ids;
 }
 
-// FIXME:
-// should do:
-// 	concat token strings
-// 	per unicode map to byte
-// 	decode as utf-8
-const char *get_word(Tokenizer tokenizer, int token) {
+const char* get_word(Tokenizer tokenizer, int token) {
 	for (int i = 0; i < tokenizer.n_vocabs; i++) {
 		if (tokenizer.vocabs[i].id == token) {
-			const char *s = tokenizer.vocabs[i].s;
+			return tokenizer.vocabs[i].s;
 		}
 	}
 	return "unknown";
+}
+
+int unicode_to_byte(int u) {
+	if ((u >= 33 && u <= 126) || (u >= 161 && u <= 172) || (u >= 174 && u <= 255)) {
+		return u;
+	}
+	if (u >= 256 && u <= 288) {
+		return u - 256;
+	}
+	if (u >= 289 && u <= 322) {
+		return u - 162;
+	}
+	return 173;
+}
+
+char* decode(Tokenizer tokenizer, int* tokens, int n) {
+	int cap = 32;
+	char* p = calloc(cap, sizeof(char));
+	for (int i = 0; i < n; i++) {
+		const char* s = get_word(tokenizer, tokens[i]);
+		while (strlen(s) + strlen(p) >= cap) {
+			cap *= 2;
+			p = realloc(p, cap);
+		}
+		strcat(p, s);
+	}
+
+	char* s = calloc(strlen(p), sizeof(char));
+	char* q = s;
+	char* u = p;
+	while (*u != '\0') {
+		if ((*u >> 7) == 0) {
+			*q = *u;
+			q++;
+			u++;
+		} else {
+			// no more than 2 byte
+			int a = ((*u) & 0b00011111);
+			u++;
+			int b = ((*u) & 0b00111111);
+			int v = (a << 6) + b;
+			*q = unicode_to_byte(v);
+			q++;
+			u++;
+		}
+	}
+
+	free(p);
+	return s;
 }
