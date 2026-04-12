@@ -1,4 +1,5 @@
-Qwen25
+Qwen2.5-0.5B
+Qwen2.5-3B
 main.py
 *.bin
 *.out
@@ -7,4 +8,4 @@ build/
 
 .*
 !.gitignore
-!.clangd
+!.clang-format

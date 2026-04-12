@@ -1,8 +1,17 @@
 
 srcs := $(wildcard src/*.c)
+target := a.out
+cflags := -lm -lopenblas
+cflags += -O2
+# cflags += -fsanitize=address -g
 
-a.out: $(srcs)
-	clang -fsanitize=address -g $(srcs) -lm -lopenblas
+.PHONY: clean run
 
-run: a.out
-	./a.out
+$(target): $(srcs)
+	clang $(cflags) $(srcs) -o $(target)
+
+run: $(target)
+	./$(target)
+
+clean:
+	rm -f $(target)

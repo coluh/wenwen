@@ -82,15 +82,15 @@ void* Qwen25_05B(ModelConfig* config, const char* model_safetensors) {
 
 	const int V = config->vocab_size;
 	const int D = config->hidden_size;
-	const int Dh = D / config->num_heads;
-	const int Hkv = config->num_kv_heads;
+	const int Dh = D / config->num_attention_heads;
+	const int Hkv = config->num_key_value_heads;
 	const int Df = config->intermediate_size;
 
 	m->embedding.table = malloc_fp32(V, D, 0, get_tensor(sf, "model.embed_tokens.weight"));
 	m->embedding.vocab_size = V;
 	m->embedding.hidden_dim = D;
 
-	for (int l = 0; l < config->num_layers; l++) {
+	for (int l = 0; l < config->num_hidden_layers; l++) {
 		struct Layer* layer = &m->layers[l];
 
 		sprintf(buffer, "model.layers.%d.input_layernorm.weight", l);
@@ -135,7 +135,7 @@ void* Qwen25_05B(ModelConfig* config, const char* model_safetensors) {
 
 void Qwen25_05B_free(Qwen25_05B_Model* model) {
 	free(model->embedding.table);
-	for (int l = 0; l < model->config->num_layers; l++) {
+	for (int l = 0; l < model->config->num_hidden_layers; l++) {
 		struct Layer* layer = &model->layers[l];
 		free(layer->norm.weight);
 		free(layer->attention.q.weight);
@@ -254,8 +254,8 @@ static void debugpx3(float* x, int d0, int d1, int d2) {
 int Qwen25_05B_inference(Qwen25_05B_Model* model, const int* tokens, int seq_len) {
 	const int N = seq_len;
 	const int D = model->config->hidden_size;
-	const int Hq = model->config->num_heads;
-	const int Hkv = model->config->num_kv_heads;
+	const int Hq = model->config->num_attention_heads;
+	const int Hkv = model->config->num_key_value_heads;
 	const int Dh = D / Hq;
 
 	const int Df = model->config->intermediate_size;
@@ -275,7 +275,7 @@ int Qwen25_05B_inference(Qwen25_05B_Model* model, const int* tokens, int seq_len
 	float* U = malloc(N * Df * sizeof(float));  // [n, d_ff]
 	float* logits = malloc(v * sizeof(float));
 
-	for (int l = 0; l < 24; l++) {
+	for (int l = 0; l < model->config->num_hidden_layers; l++) {
 		float* W_Q = model->layers[l].attention.q.weight;  // [d, d]
 		float* W_K = model->layers[l].attention.k.weight;  // [d, d]
 		float* W_V = model->layers[l].attention.v.weight;  // [d, d]
