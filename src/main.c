@@ -16,7 +16,6 @@ int main(int argc, char* argv[]) {
 	} else {
 		s = u8"The last man on Earth sat alone in a room.";
 	}
-	printf("input: %s\n", s);
 
 	int n;
 	int* tokens = tokenize(t, s, &n);
@@ -28,24 +27,21 @@ int main(int argc, char* argv[]) {
 		}
 	}
 	printf(" ]\n");
+	printf("\x1B[1;32m%s\x1B[0m", s);
+	fflush(stdout);
 
 	ModelConfig* config = read_config(MODEL "/config.json");
 	void* model = Qwen25_05B(config, MODEL "/model.safetensors");
 
 	int outputs[4];
 	int outputs_i = 0;
-	int i = 0;
 	while (1) {
 		// printf("\r %d / %d", i, 16);
 		int token = Qwen25_05B_inference(model, tokens, n);
 		if (token == config->eos_token_id) {
-			printf("<|eos|>\n");
+			printf("<|eos|>");
 			break;
 		}
-
-		n++;
-		tokens = realloc(tokens, n * sizeof(int));
-		tokens[n - 1] = token;
 
 		outputs[outputs_i] = token;
 		outputs_i++;
@@ -56,14 +52,17 @@ int main(int argc, char* argv[]) {
 				printf("%s", output);
 			}
 		}
-
 		fflush(stdout);
-		i++;
-		// if (i == 64) {
-		// 	break;
-		// }
+
+		n++;
+		tokens = realloc(tokens, n * sizeof(int));
+		tokens[n - 1] = token;
+		if (n >= 4096) {
+			break;
+		}
 	}
 
+	printf("\n");
 	Qwen25_05B_free(model);
 	free(config);
 	free(tokens);

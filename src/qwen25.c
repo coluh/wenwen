@@ -49,6 +49,11 @@ typedef struct Qwen25_05B_Model {
 	} layers[24];
 	Norm norm;
 
+	int max_seq;
+	float* k_cache;
+	float* v_cache;
+	int cache_seq_len;
+
 	const ModelConfig* config;
 	SafeTensors* sf;
 } Qwen25_05B_Model;
@@ -130,6 +135,13 @@ void* Qwen25_05B(ModelConfig* config, const char* model_safetensors) {
 	m->norm.weight = malloc_fp32(D, 1, 0, get_tensor(sf, "model.norm.weight"));
 	m->norm.eps = config->rms_norm_eps;
 
+	m->max_seq = 4096;
+	int size = config->num_hidden_layers * Hkv * m->max_seq * Dh;
+	m->k_cache = malloc(size * sizeof(float));
+	m->v_cache = malloc(size * sizeof(float));
+	m->cache_seq_len = 0;
+
+	free_safetensors(m->sf);
 	return m;
 }
 
@@ -151,7 +163,8 @@ void Qwen25_05B_free(Qwen25_05B_Model* model) {
 		free(layer->mlp.down.weight);
 	}
 	free(model->norm.weight);
-	free_safetensors(model->sf);
+	free(model->k_cache);
+	free(model->v_cache);
 	free(model);
 }
 
@@ -183,15 +196,16 @@ void rms_norm(float* x, int hidden_dim, Norm norm) {
 	}
 }
 
-void rope(float* Q, int seq_len, int num_heads, int head_dim, float rope_theta) {
+void rope(float* Q, int current_pos, int len, int num_heads, int head_dim, float rope_theta) {
 	int half_dim = head_dim / 2;
 
-	for (int pos = 0; pos < seq_len; pos++) {
+	for (int i = 0; i < len; i++) {
 		for (int h = 0; h < num_heads; h++) {
 			for (int m = 0; m < half_dim; m++) {
+				int pos = current_pos + i;
 				float angle = pos * powf(rope_theta, -1.0f * m / half_dim);
 
-				int idx = (pos * num_heads + h) * head_dim + m;
+				int idx = (i * num_heads + h) * head_dim + m;
 				float x0 = Q[idx];
 				float x1 = Q[idx + half_dim];
 				Q[idx] = x0 * cosf(angle) - x1 * sinf(angle);
@@ -265,15 +279,18 @@ int Qwen25_05B_inference(Qwen25_05B_Model* model, const int* tokens, int seq_len
 	float* X = embed_tokens(model->embedding, tokens, N);
 	float* R = malloc(N * D * sizeof(float));
 
-	float* Q = malloc(N * Hq * Dh * sizeof(float));	  // [n, h, hd]
-	float* K = malloc(N * Hkv * Dh * sizeof(float));  // [n, kvh, hd]
-	float* V = malloc(N * Hkv * Dh * sizeof(float));  // [n, kvh, hd]
-	float* T = malloc(N * D * sizeof(float));	  // [n, d]
-	float* A = malloc(N * N * sizeof(float));	  // [n, n]
+	const int Nmax = model->max_seq;
+	const int dN = seq_len - model->cache_seq_len;	// just N or 1
+	float* X1 = X + (N - dN) * D;
+	float* Q = malloc(dN * Hq * Dh * sizeof(float));   // [dN, h, hd]
+	float* K = malloc(dN * Hkv * Dh * sizeof(float));  // [dN, kvh, hd]
+	float* V = malloc(dN * Hkv * Dh * sizeof(float));  // [dN, kvh, hd]
+	float* T = malloc(N * D * sizeof(float));	   // [n, d]
+	float* A = malloc(dN * N * sizeof(float));	   // [dn, n]
 
-	float* O = malloc(N * D * sizeof(float));   // [n, d]
-	float* G = malloc(N * Df * sizeof(float));  // [n, d_ff]
-	float* U = malloc(N * Df * sizeof(float));  // [n, d_ff]
+	float* O = malloc(dN * D * sizeof(float));   // [h, dn, hd]
+	float* G = malloc(dN * Df * sizeof(float));  // [dn, d_ff]
+	float* U = malloc(dN * Df * sizeof(float));  // [dn, d_ff]
 	float* logits = malloc(v * sizeof(float));
 
 	for (int l = 0; l < model->config->num_hidden_layers; l++) {
@@ -286,105 +303,114 @@ int Qwen25_05B_inference(Qwen25_05B_Model* model, const int* tokens, int seq_len
 		float* W_D = model->layers[l].mlp.down.weight;	   // [df, d]
 
 		// 1. input norm
-		memcpy(R, X, N * D * sizeof(float));
-		for (int i = 0; i < N; i++) {
-			rms_norm(X + i * D, D, model->layers[l].norm);
+		memcpy(R, X1, dN * D * sizeof(float));
+		for (int i = 0; i < dN; i++) {
+			rms_norm(X1 + i * D, D, model->layers[l].norm);
 		}
-		// debugpx(X, N, D);
 
 		// 2. self attention
 		// 2.1 project
-		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, D, D, 1.0f, X, D, W_Q, D, 0.0f, Q, D);
-		for (int i = 0; i < N * D; i++) {
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, dN, D, D, 1.0f, X1, D, W_Q, D, 0.0f, Q, D);
+		for (int i = 0; i < dN * D; i++) {
 			Q[i] += model->layers[l].attention.q.bias[i % D];
 		}
-		// debugpx(Q, N, D);
 		const int kvd = Hkv * Dh;
-		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, kvd, D, 1.0f, X, D, W_K, kvd, 0.0f, K, kvd);
-		for (int i = 0; i < N * kvd; i++) {
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, dN, kvd, D, 1.0f, X1, D, W_K, kvd, 0.0f, K, kvd);
+		for (int i = 0; i < dN * kvd; i++) {
 			K[i] += model->layers[l].attention.k.bias[i % kvd];
 		}
-		// debugpx(K, N, kvd);
-		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, kvd, D, 1.0f, X, D, W_V, kvd, 0.0f, V, kvd);
-		for (int i = 0; i < N * kvd; i++) {
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, dN, kvd, D, 1.0f, X1, D, W_V, kvd, 0.0f, V, kvd);
+		for (int i = 0; i < dN * kvd; i++) {
 			V[i] += model->layers[l].attention.v.bias[i % kvd];
 		}
 
 		// 2.2 RoPE
-		rope(Q, N, Hq, Dh, model->config->rope_theta);
-		rope(K, N, Hkv, Dh, model->config->rope_theta);
+		rope(Q, N - dN, dN, Hq, Dh, model->config->rope_theta);
+		rope(K, N - dN, dN, Hkv, Dh, model->config->rope_theta);
 
 		// 2.3 Attention
 		// [n, d] -> [n, h, dk] -> [h, n, dk]
-		transpose(Q, T, N, Hq, Dh);
-		memcpy(Q, T, N * D * sizeof(float));
-		transpose(K, T, N, Hkv, Dh);
-		memcpy(K, T, N * kvd * sizeof(float));
-		transpose(V, T, N, Hkv, Dh);
-		memcpy(V, T, N * kvd * sizeof(float));
+		transpose(Q, T, dN, Hq, Dh);
+		memcpy(Q, T, dN * D * sizeof(float));
+		transpose(K, T, dN, Hkv, Dh);
+		memcpy(K, T, dN * kvd * sizeof(float));
+		transpose(V, T, dN, Hkv, Dh);
+		memcpy(V, T, dN * kvd * sizeof(float));
 		// TODO: int stride = 0l;
 
+		// append to cache
+		float* k_cache = model->k_cache + l * Hkv * Nmax * Dh;	// [Hkv, Nmax, Dh], while K: [Hkv, dN, Dh]
+		float* v_cache = model->v_cache + l * Hkv * Nmax * Dh;
+		for (int i = 0; i < dN; i++) {
+			int p = N - dN + i;
+			for (int h = 0; h < Hkv; h++) {
+				memcpy(k_cache + h * Nmax * Dh + p * Dh, K + h * dN * Dh + i * Dh, Dh * sizeof(float));
+				memcpy(v_cache + h * Nmax * Dh + p * Dh, V + h * dN * Dh + i * Dh, Dh * sizeof(float));
+			}
+		}
+
 		for (int head = 0; head < Hq; head++) {
-			float* Kh = K + (head / (Hq / Hkv)) * N * Dh;  // [n, hd]
-			float* Vh = V + (head / (Hq / Hkv)) * N * Dh;  // [n, hd]
-			float* Qh = Q + (head)*N * Dh;		       // [n, hd]
-			float* Ah = A;				       // [n, n]
-			float* Oh = O + (head)*N * Dh;		       // [n, hd]
+			int kvh = head / (Hq / Hkv);
+			float* Kh = k_cache + kvh * Nmax * Dh;	// [n, hd]
+			float* Vh = v_cache + kvh * Nmax * Dh;	// [n, hd]
+			float* Qh = Q + (head)*dN * Dh;		// [dn, hd]
+			float* Oh = O + (head)*dN * Dh;		// [dn, hd]
 
 			const float a = 1.0f / sqrtf((float)Dh);
 			// QK^T/sqrt(d_k)
-			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, N, Dh, a, Qh, Dh, Kh, Dh, 0.0f, Ah, N);
+			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, dN, N, Dh, a, Qh, Dh, Kh, Dh, 0.0f, A, N);
 			// ...+M
-			for (int i = 0; i < N; i++) {
-				for (int j = i + 1; j < N; j++) {
-					Ah[i * N + j] = -1e4f;
+			for (int i = 0; i < dN; i++) {
+				for (int j = N - dN + i + 1; j < N; j++) {
+					A[i * N + j] = -1e4f;
 				}
 			}
 			// Softmax(...)
-			for (int i = 0; i < N; i++) {
-				softmax(Ah + i * N, N);
+			for (int i = 0; i < dN; i++) {
+				softmax(A + i * N, N);
 			}
 			// O = AV
-			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, Dh, N, 1.f, Ah, N, Vh, Dh, 0, Oh, Dh);
+			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, dN, Dh, N, 1.f, A, N, Vh, Dh, 0, Oh, Dh);
 		}
 
 		// concat multi head
-		// O: [h, n, dk] -> [n, h, dk] -> [n, d]
-		transpose(O, T, Hq, N, Dh);
-		memcpy(O, T, N * D * sizeof(float));
+		// O: [h, dn, dk] -> [dn, h, dk] -> [dn, d]
+		transpose(O, T, Hq, dN, Dh);
+		memcpy(O, T, dN * D * sizeof(float));
 
 		// 2.4 Residual
 		// X_mid = X + OW_O
-		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, D, D, 1.0f, O, D, W_O, D, 0.0f, X, D);
-		for (int i = 0; i < N * D; i++) {
-			X[i] += R[i];
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, dN, D, D, 1.0f, O, D, W_O, D, 0.0f, X1, D);
+		for (int i = 0; i < dN * D; i++) {
+			X1[i] += R[i];
 		}
-		memcpy(R, X, N * D * sizeof(float));
+		memcpy(R, X1, dN * D * sizeof(float));
 
 		// correct
 
 		// 3. FFN
-		for (int i = 0; i < N; i++) {
-			rms_norm(X + i * D, D, model->layers[l].post_norm);
+		for (int i = 0; i < dN; i++) {
+			rms_norm(X1 + i * D, D, model->layers[l].post_norm);
 		}
 		// (SiLU(G) * (U)) x D
-		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, Df, D, 1.0f, X, D, W_G, Df, 0.0f, G, Df);
-		for (int i = 0; i < N * Df; i++) {
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, dN, Df, D, 1.0f, X1, D, W_G, Df, 0.0f, G, Df);
+		for (int i = 0; i < dN * Df; i++) {
 			G[i] = silu(G[i]);
 		}
-		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, Df, D, 1.0f, X, D, W_U, Df, 0.0f, U, Df);
-		for (int i = 0; i < N * Df; i++) {
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, dN, Df, D, 1.0f, X1, D, W_U, Df, 0.0f, U, Df);
+		for (int i = 0; i < dN * Df; i++) {
 			U[i] = G[i] * U[i];
 		}
 		// Residual
-		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, D, Df, 1.0f, U, Df, W_D, D, 1.0f, R, D);
-		memcpy(X, R, N * D * sizeof(float));
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, dN, D, Df, 1.0f, U, Df, W_D, D, 1.0f, R, D);
+		memcpy(X1, R, dN * D * sizeof(float));
 	}
+	model->cache_seq_len += dN;
 
-	for (int i = 0; i < N; i++) {
-		rms_norm(X + i * D, D, model->norm);
+	for (int i = 0; i < dN; i++) {
+		rms_norm(X1 + i * D, D, model->norm);
 	}
-	float* y_n = X + (N - 1) * D;
+	float* y_n = X1 + (dN - 1) * D;
 	float* W_E = model->embedding.table;
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, v, D, 1.0f, y_n, D, W_E, D, 0.0f, logits, v);
 
