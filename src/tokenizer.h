@@ -23,5 +23,6 @@ void free_tokenizer(Tokenizer t);
 
 int* tokenize(Tokenizer tokenizer, const char* input, int* out_n);
 char *decode(Tokenizer tokenizer, int *tokens, int n);
+const char *decode_stream(Tokenizer tokenizer, int* tokens, int *n);
 
 #endif

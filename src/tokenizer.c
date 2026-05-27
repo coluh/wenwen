@@ -305,3 +305,73 @@ char* decode(Tokenizer tokenizer, int* tokens, int n) {
 	free(p);
 	return s;
 }
+
+static int utf8_len(unsigned char c) {
+	if ((c >> 7) == 0) return 1;	    // 0xxxxxxx
+	if ((c >> 5) == 0b110) return 2;    // 110xxxxx
+	if ((c >> 4) == 0b1110) return 3;   // 1110xxxx
+	if ((c >> 3) == 0b11110) return 4;  // 11110xxx
+	return 0;
+}
+
+#define MAX_TOKEN_LEN 128
+
+// decode some utf8 chars
+// consume 1 to n tokens, save remaining n
+// usage:
+// int tokens[n];
+// while (n > 0) {
+// 	const char *s = decode_stream(tokenizer, tokens, &n);
+// 	if (s) printf(s);
+// }
+const char* decode_stream(Tokenizer tokenizer, int* tokens, int* n) {
+	/*
+	 * token map to utf8 string, split by byte, map to origin bytes, to utf8 string
+	 * 1 token -> [1, MAX_TOKEN_LEN] bytes -> [1, MAX_TOKEN_LEN] bytes -> [0, MAX_TOKEN_LEN] utf chars
+	 */
+	static char buffer[MAX_TOKEN_LEN + 8] = {0};  // TODO: can use a ring buffer
+	static char utf8_buffer[MAX_TOKEN_LEN + 8] = {0};
+
+	while (strlen(buffer) < 8 && *n > 0) {
+		const char* s = get_word(tokenizer, *tokens);
+		for (int i = 0; i < *n - 1; i++) {
+			tokens[i] = tokens[i + 1];
+		}
+		(*n)--;
+		strcat(buffer, s);
+	}
+
+	memset(utf8_buffer, 0, MAX_TOKEN_LEN + 8);
+	// 1 utf8 char -> [1, 4] bytes -> map to unicodes -> [2, 8] converted bytes
+	while (strlen(buffer) >= 8) {
+		char out[5];
+		int used[4];
+		char* u = buffer;
+		for (int i = 0; i < 4; i++) {
+			if ((*u >> 7) == 0) {
+				out[i] = *u++;
+				used[i] = 1;
+			} else {
+				int a = ((*u++) & 0b00011111);
+				int b = ((*u++) & 0b00111111);
+				int v = (a << 6) + b;
+				out[i] = unicode_to_byte(v);
+				used[i] = 2;
+			}
+		};
+		int len = utf8_len(out[0]);
+		out[len] = '\0';
+		strcat(utf8_buffer, out);
+
+		int used_len = 0;
+		for (int i = 0; i < len; i++) {
+			used_len += used[i];
+		}
+		int buffer_len = strlen(buffer);
+		memmove(buffer, buffer + used_len, buffer_len - used_len);
+		buffer[buffer_len - used_len] = '\0';
+		return utf8_buffer;
+	}
+
+	return NULL;
+}

@@ -5,13 +5,17 @@
 #include "qwen25.h"
 #include "tokenizer.h"
 
-int main() {
+#define MODEL "./Qwen2.5-0.5B"
 
-	const char *path = "./Qwen2.5-0.5B";
+int main(int argc, char* argv[]) {
+	Tokenizer t = new_tokenizer(MODEL "/vocab.json", MODEL "/merges.txt");
 
-	Tokenizer t = new_tokenizer("./Qwen2.5-0.5B/vocab.json", "./Qwen2.5-0.5B/merges.txt");
-
-	const char* s = u8"你好，我是Leo，我是游戏行业的老兵";
+	char* s;
+	if (argc >= 2) {
+		s = argv[1];
+	} else {
+		s = u8"The last man on Earth sat alone in a room.";
+	}
 	printf("input: %s\n", s);
 
 	int n;
@@ -25,41 +29,41 @@ int main() {
 	}
 	printf(" ]\n");
 
-	ModelConfig* config = read_config("./Qwen2.5-0.5B/config.json");
-	void* model = Qwen25_05B(config, "./Qwen2.5-0.5B/model.safetensors");
+	ModelConfig* config = read_config(MODEL "/config.json");
+	void* model = Qwen25_05B(config, MODEL "/model.safetensors");
 
-	int cap = 32;
-	int *outputs = malloc(cap*sizeof(int));
+	int outputs[4];
+	int outputs_i = 0;
 	int i = 0;
 	while (1) {
-		printf("\r %d / %d", i, 32);
-		fflush(stdout);
+		// printf("\r %d / %d", i, 16);
 		int token = Qwen25_05B_inference(model, tokens, n);
 		if (token == config->eos_token_id) {
+			printf("<|eos|>\n");
 			break;
 		}
 
 		n++;
-		tokens = realloc(tokens, n*sizeof(int));
-		tokens[n-1] = token;
+		tokens = realloc(tokens, n * sizeof(int));
+		tokens[n - 1] = token;
 
-		outputs[i] = token;
+		outputs[outputs_i] = token;
+		outputs_i++;
+
+		while (outputs_i > 0) {
+			const char* output = decode_stream(t, outputs, &outputs_i);
+			if (output) {
+				printf("%s", output);
+			}
+		}
+
+		fflush(stdout);
 		i++;
-		if (i == 32) {
-			break;
-		}
-		if (i >= cap) {
-			cap *= 2;
-			outputs = realloc(outputs, cap*sizeof(int));
-		}
+		// if (i == 64) {
+		// 	break;
+		// }
 	}
-	printf("\n");
 
-	char *output = decode(t, outputs, i);
-	printf("complete: %s%s\n", s, output);
-
-	free(output);
-	free(outputs);
 	Qwen25_05B_free(model);
 	free(config);
 	free(tokens);

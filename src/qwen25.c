@@ -190,6 +190,7 @@ void rope(float* Q, int seq_len, int num_heads, int head_dim, float rope_theta) 
 		for (int h = 0; h < num_heads; h++) {
 			for (int m = 0; m < half_dim; m++) {
 				float angle = pos * powf(rope_theta, -1.0f * m / half_dim);
+
 				int idx = (pos * num_heads + h) * head_dim + m;
 				float x0 = Q[idx];
 				float x1 = Q[idx + half_dim];
@@ -321,7 +322,7 @@ int Qwen25_05B_inference(Qwen25_05B_Model* model, const int* tokens, int seq_len
 		memcpy(K, T, N * kvd * sizeof(float));
 		transpose(V, T, N, Hkv, Dh);
 		memcpy(V, T, N * kvd * sizeof(float));
-		int stride = 0l;
+		// TODO: int stride = 0l;
 
 		for (int head = 0; head < Hq; head++) {
 			float* Kh = K + (head / (Hq / Hkv)) * N * Dh;  // [n, hd]
