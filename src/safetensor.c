@@ -10,6 +10,7 @@
 
 #include "cJSON.h"
 
+// TODO: load sliced weights
 SafeTensors* load_safetensors(const char* model_safetensors) {
 	SafeTensors* sf = calloc(1, sizeof(SafeTensors));
 

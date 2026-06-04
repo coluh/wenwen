@@ -2,8 +2,8 @@
 srcs := $(wildcard src/*.c)
 target := a.out
 cflags := -lm -lopenblas
-cflags += -O2
 CFLAGS += -Wall -Wextra -Wpedantic
+cflags += -O2
 # cflags += -fsanitize=address -g
 
 .PHONY: clean run
