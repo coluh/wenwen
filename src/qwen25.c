@@ -266,6 +266,8 @@ static void debugpx3(float* x, int d0, int d1, int d2) {
 	}
 }
 
+void Qwen25_05B_forward();
+
 int Qwen25_05B_inference(Qwen25_05B_Model* model, const int* tokens, int seq_len) {
 	const int N = seq_len;
 	const int D = model->config->hidden_size;

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "config.h"
 #include "qwen25.h"
@@ -8,6 +9,8 @@
 #define MODEL "./Qwen2.5-0.5B"
 
 int main(int argc, char* argv[]) {
+	srand((unsigned)time(NULL));
+
 	Tokenizer t = new_tokenizer(MODEL "/vocab.json", MODEL "/merges.txt");
 
 	char* s;
