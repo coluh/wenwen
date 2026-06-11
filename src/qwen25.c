@@ -49,10 +49,16 @@ typedef struct Qwen25_05B_Model {
 	} layers[24];
 	Norm norm;
 
+	// inference KV Cache
 	int max_seq;
 	float* k_cache;
 	float* v_cache;
 	int cache_seq_len;
+
+	// train cache
+	float* rope_freqs;
+	float* rope_cos;
+	float* rope_sin;
 
 	const ModelConfig* config;
 	SafeTensors* sf;
@@ -135,11 +141,28 @@ void* Qwen25_05B(ModelConfig* config, const char* model_safetensors) {
 	m->norm.weight = malloc_fp32(D, 1, 0, get_tensor(sf, "model.norm.weight"));
 	m->norm.eps = config->rms_norm_eps;
 
-	m->max_seq = 4096;
+	m->max_seq = 512;  // TODO: config this!
 	int size = config->num_hidden_layers * Hkv * m->max_seq * Dh;
 	m->k_cache = malloc(size * sizeof(float));
 	m->v_cache = malloc(size * sizeof(float));
 	m->cache_seq_len = 0;
+
+	// TODO: move to ModelRunner struct
+	const float theta = m->config->rope_theta;
+	int half_dim = Dh / 2;
+	m->rope_freqs = malloc(half_dim * sizeof(float));
+	m->rope_cos = malloc(m->max_seq * half_dim * sizeof(float));
+	m->rope_sin = malloc(m->max_seq * half_dim * sizeof(float));
+	for (int i = 0; i < half_dim; i++) {
+		m->rope_freqs[i] = 1.0f / powf(theta, (float)i / half_dim);
+	}
+	for (int p = 0; p < m->max_seq; p++) {
+		for (int i = 0; i < half_dim; i++) {
+			float angle = p * m->rope_freqs[i];
+			m->rope_cos[p * half_dim + i] = cosf(angle);
+			m->rope_sin[p * half_dim + i] = sinf(angle);
+		}
+	}
 
 	free_safetensors(m->sf);
 	return m;
@@ -165,6 +188,9 @@ void Qwen25_05B_free(Qwen25_05B_Model* model) {
 	free(model->norm.weight);
 	free(model->k_cache);
 	free(model->v_cache);
+	free(model->rope_freqs);
+	free(model->rope_cos);
+	free(model->rope_sin);
 	free(model);
 }
 
@@ -266,7 +292,203 @@ static void debugpx3(float* x, int d0, int d1, int d2) {
 	}
 }
 
-void Qwen25_05B_forward();
+void rmsnorm1(Norm* n, float* X, int B, int S, int D) {
+	for (int b = 0; b < B; b++) {
+		for (int s = 0; s < S; s++) {
+			float* Xi = X + (b * S + s) * D;  // [D]
+			float sq_sum = cblas_sdot(D, Xi, 1, Xi, 1);
+			float mean_sq = sq_sum / D;
+			float rms = sqrtf(mean_sq + n->eps);
+			float rrms = 1.0f / rms;
+			for (int i = 0; i < D; i++) {
+				Xi[i] = Xi[i] * rrms * n->weight[i];
+			}
+		}
+	}
+}
+
+void rope1(Qwen25_05B_Model* m, float* T, int B, int S, int H, int Dh) {
+	int half_dim = Dh / 2;
+	for (int b = 0; b < B; b++) {  // not used
+		for (int s = 0; s < S; s++) {
+			for (int h = 0; h < H; h++) {  // not used
+				for (int d = 0; d < half_dim; d++) {
+					int idx = ((b * S + s) * H + h) * Dh + d;
+					float x0 = T[idx];
+					float x1 = T[idx + 1];
+					float cosv = m->rope_cos[s * half_dim + d];
+					float sinv = m->rope_sin[s * half_dim + d];
+					T[idx] = x0 * cosv - x1 * sinv;
+					T[idx + 1] = x0 * sinv + x1 * cosv;
+				}
+			}
+		}
+	}
+}
+
+float* Qwen25_05B_forward(Qwen25_05B_Model* model, const int* inputs, const int B, const int S, bool grad) {
+	const int v = model->config->vocab_size;
+	const int D = model->config->hidden_size;
+	const int Hq = model->config->num_attention_heads;
+	const int Hkv = model->config->num_key_value_heads;  // key/value heads
+	const int Dh = D / Hq;				     // head_dim
+	const int Dq = D;
+	const int Dkv = Hkv * Dh;
+	const int Df = model->config->intermediate_size;
+	int eos_pos = -1;
+	for (int s = 1; s < S; s++) {
+		if (inputs[s] == -100) {  // TODO: config
+			eos_pos = s;
+		}
+	}
+
+	// TODO: move to ModelRunner, avoid alloc every forward
+	float* X = malloc(B * S * D * sizeof(float));
+	float* R = malloc(B * S * D * sizeof(float));	      // same as X, for residual
+	float* Q = malloc(B * S * D * sizeof(float));	      // [B, S, D], or say [B, S, Hq, Dh]
+	float* K = malloc(B * S * Hkv * Dh * sizeof(float));  // [B, S, Hkv, Dh]
+	float* V = malloc(B * S * Hkv * Dh * sizeof(float));  // [B, S, Hkv, Dh]
+	float* Ah = malloc(S * S * sizeof(float));	      // [S, S]
+	float* O = malloc(B * S * D * sizeof(float));	      // [B, S, Hq, Dh]
+	float* G = malloc(B * S * Df * sizeof(float));
+	float* U = malloc(B * S * Df * sizeof(float));
+	float* logits = malloc(B * S * v * sizeof(float));
+
+	// embed tokens
+	// inputs: [B, S]
+	// embedding: [V, D]
+	// X: [B, S, D] = [embedding[v] for v in x.flatten()].reshape(B, S, -1)
+	for (int b = 0; b < B; b++) {
+		for (int s = 0; s < S; s++) {
+			int token = inputs[b * S + s];
+			float* v = model->embedding.table + token * D;
+			memcpy(X + (b * S + s) * D, v, D * sizeof(float));
+		}
+	}
+
+	for (int l = 0; l < model->config->num_hidden_layers; l++) {
+		float* Wq = model->layers[l].attention.q.weight;  // [D, D] = [D, Hq*Dh]
+		float* Wk = model->layers[l].attention.k.weight;  // [D, Hkv*Dh]
+		float* Wv = model->layers[l].attention.v.weight;  // [D, Hkv*Dh]
+		float* Wo = model->layers[l].attention.o.weight;  // [D, D]
+		float* Wg = model->layers[l].mlp.gate.weight;	  // [D, Df]
+		float* Wu = model->layers[l].mlp.up.weight;	  // [D, Df]
+		float* Wd = model->layers[l].mlp.down.weight;	  // [Df, D]
+
+		// save for residual
+		memcpy(R, X, B * S * D * sizeof(float));
+
+		// RMSNorm on last dimension
+		rmsnorm1(&model->layers[l].norm, X, B, S, D);
+
+		// X: [B, S, D]
+		// get Q: [B, S, D], K, V: [B, S, Hkv*Dh]
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, B * S, Dq, D, 1.0f, X, D, Wq, Dq, 0.0f, Q, Dq);
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, B * S, Dkv, D, 1.0f, X, D, Wk, Dkv, 0.0f, K,
+			    Dkv);
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, B * S, Dkv, D, 1.0f, X, D, Wv, Dkv, 0.0f, V,
+			    Dkv);
+
+		// RoPE Q, K
+		rope1(model, Q, B, S, Hq, Dh);
+		rope1(model, K, B, S, Hkv, Dh);
+
+		// get attention scores
+		// avoid transpose
+		for (int b = 0; b < B; b++) {
+			float* Qb = Q + b * S * Hq * Dh;   // [S, Hq, Dh]
+			float* Kb = K + b * S * Hkv * Dh;  // [S, Hkv, Dh]
+			float* Vb = V + b * S * Hkv * Dh;  // [S, Hkv, Dh]
+			float* Ob = O + b * S * Hq * Dh;   // [S, Hq, Dh]
+			for (int h = 0; h < Hq; h++) {
+				int hq = h;
+				int hkv = h * Hkv / Hq;
+
+				// Qh:    [S, Dh] = Qb[:, hq, :]
+				// Kh/Vh: [S, Dh] = Kb/Vb[:, hkv, :]
+				// Oh:    [S, Dh] = Ob[:, hq, :]
+				float* Qh = Qb + hq * Dh;   // start of Qh, lasting Dh, skip Hq*Dh
+							    // lasting Dh, skip Hq*Dh...
+				float* Kh = Kb + hkv * Dh;  // stride = Hkv*Dh
+				float* Vh = Vb + hkv * Dh;
+				float* Oh = Ob + hq * Dh;
+
+				// Ah = softmax(Q @ K^T / sqrt(Dh) + M)
+				// 	[S, Dh] @ [Dh, S]
+				float a = 1.0f / sqrtf(Dh);
+				cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, S, Dh, a, Qh, Hq * Dh, Kh,
+					    Hkv * Dh, 0.0f, Ah, S);
+				// attention mask
+				if (eos_pos >= 0) {
+					for (int i = 0; i < S; i++) {
+						for (int j = eos_pos + 1; j < S; j++) {
+							Ah[i * S + j] = -1e9f;
+						}
+					}
+				}
+				for (int i = 0; i < S; i++) {
+					// causal mask
+					for (int j = i + 1; j < S; j++) {
+						Ah[i * S + j] = -1e9f;
+					}
+					// softmax
+					softmax(Ah + i * S, S);
+				}
+
+				// Oh = Ah @ Vh
+				// 	[S, S] @ [S, Dh]
+				cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, S, Dh, S, 1.0f, Ah, S, Vh,
+					    Hkv * Dh, 0.0f, Oh, Hq * Dh);
+			}
+		}
+
+		// residual
+		// X = R + O @ Wo
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, B * S, D, D, 1.0f, O, D, Wo, D, 0.0f, X, D);
+		for (int i = 0; i < B * S * D; i++) {
+			X[i] += R[i];
+		}
+
+		// save for residual
+		memcpy(R, X, B * S * D * sizeof(float));
+
+		// FFN
+		rmsnorm1(&model->layers[l].post_norm, X, B, S, D);
+		// (SiLU(G) * (U)) x D
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, B * S, Df, D, 1.0f, X, D, Wg, Df, 0.0f, G, Df);
+		for (int i = 0; i < B * S * Df; i++) {
+			G[i] = silu(G[i]);
+		}
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, B * S, Df, D, 1.0f, X, D, Wu, Df, 0.0f, U, Df);
+		for (int i = 0; i < B * S * Df; i++) {
+			U[i] = G[i] * U[i];
+		}
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, B * S, D, Df, 1.0f, U, Df, Wd, D, 0.0f, X, D);
+		for (int i = 0; i < B * S * D; i++) {
+			X[i] += R[i];
+		}
+	}
+
+	rmsnorm1(&model->norm, X, B, S, D);
+	// X: [B, S, D], E: [V, D]
+	// -> [B, S, V]
+	const float* We = model->embedding.table;
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, B * S, v, D, 1.0f, X, D, We, D, 0.0f, logits, v);
+	for (int i = 0; i < B * S; i++) {
+		softmax(logits + i * v, v);
+	}
+
+	free(X);
+	free(R);
+	free(Q);
+	free(K);
+	free(V);
+	free(Ah);
+	free(O);
+	free(G);
+	free(U);
+	return logits;
+}
 
 int Qwen25_05B_inference(Qwen25_05B_Model* model, const int* tokens, int seq_len) {
 	const int N = seq_len;
