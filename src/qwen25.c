@@ -29,7 +29,7 @@ typedef struct Norm {
 	float eps;
 } Norm;
 
-typedef struct Qwen25_05B_Model {
+typedef struct Model {
 	Embedding embedding;
 
 	struct Layer {
@@ -55,14 +55,9 @@ typedef struct Qwen25_05B_Model {
 	float* v_cache;
 	int cache_seq_len;
 
-	// train cache
-	float* rope_freqs;
-	float* rope_cos;
-	float* rope_sin;
-
 	const ModelConfig* config;
 	SafeTensors* sf;
-} Qwen25_05B_Model;
+} Model;
 
 float* malloc_fp32(int rows, int cols, int trans, uint16_t* bf16data) {
 	float* p = malloc(rows * cols * sizeof(float));
@@ -85,7 +80,7 @@ float* malloc_fp32(int rows, int cols, int trans, uint16_t* bf16data) {
 }
 
 void* Qwen25_05B(ModelConfig* config, const char* model_safetensors) {
-	Qwen25_05B_Model* m = calloc(1, sizeof(Qwen25_05B_Model));
+	Model* m = calloc(1, sizeof(Model));
 	SafeTensors* sf = load_safetensors(model_safetensors);
 	m->config = config;
 	m->sf = sf;
@@ -147,28 +142,11 @@ void* Qwen25_05B(ModelConfig* config, const char* model_safetensors) {
 	m->v_cache = malloc(size * sizeof(float));
 	m->cache_seq_len = 0;
 
-	// TODO: move to ModelRunner struct
-	const float theta = m->config->rope_theta;
-	int half_dim = Dh / 2;
-	m->rope_freqs = malloc(half_dim * sizeof(float));
-	m->rope_cos = malloc(m->max_seq * half_dim * sizeof(float));
-	m->rope_sin = malloc(m->max_seq * half_dim * sizeof(float));
-	for (int i = 0; i < half_dim; i++) {
-		m->rope_freqs[i] = 1.0f / powf(theta, (float)i / half_dim);
-	}
-	for (int p = 0; p < m->max_seq; p++) {
-		for (int i = 0; i < half_dim; i++) {
-			float angle = p * m->rope_freqs[i];
-			m->rope_cos[p * half_dim + i] = cosf(angle);
-			m->rope_sin[p * half_dim + i] = sinf(angle);
-		}
-	}
-
 	free_safetensors(m->sf);
 	return m;
 }
 
-void Qwen25_05B_free(Qwen25_05B_Model* model) {
+void Qwen25_05B_free(Model* model) {
 	free(model->embedding.table);
 	for (int l = 0; l < model->config->num_hidden_layers; l++) {
 		struct Layer* layer = &model->layers[l];
@@ -188,9 +166,6 @@ void Qwen25_05B_free(Qwen25_05B_Model* model) {
 	free(model->norm.weight);
 	free(model->k_cache);
 	free(model->v_cache);
-	free(model->rope_freqs);
-	free(model->rope_cos);
-	free(model->rope_sin);
 	free(model);
 }
 
@@ -307,7 +282,7 @@ void rmsnorm1(Norm* n, float* X, int B, int S, int D) {
 	}
 }
 
-void rope1(Qwen25_05B_Model* m, float* T, int B, int S, int H, int Dh) {
+void rope1(Model* m, float* T, int B, int S, int H, int Dh) {
 	int half_dim = Dh / 2;
 	for (int b = 0; b < B; b++) {  // not used
 		for (int s = 0; s < S; s++) {
@@ -326,19 +301,105 @@ void rope1(Qwen25_05B_Model* m, float* T, int B, int S, int H, int Dh) {
 	}
 }
 
-float* Qwen25_05B_forward(Qwen25_05B_Model* model, const int* inputs, const int B, const int S, bool grad) {
-	const int v = model->config->vocab_size;
-	const int D = model->config->hidden_size;
-	const int Hq = model->config->num_attention_heads;
-	const int Hkv = model->config->num_key_value_heads;  // key/value heads
-	const int Dh = D / Hq;				     // head_dim
-	const int Dq = D;
-	const int Dkv = Hkv * Dh;
-	const int Df = model->config->intermediate_size;
-	int eos_pos = -1;
-	for (int s = 1; s < S; s++) {
-		if (inputs[s] == -100) {  // TODO: config
-			eos_pos = s;
+ModelRunner* new_modelrunner(Model* model, int batch_size, int max_seq_len) {
+	ModelRunner* mr = malloc(sizeof(ModelRunner));
+
+	mr->B = batch_size;
+	mr->S = max_seq_len;
+	mr->V = model->config->vocab_size;
+	mr->L = model->config->num_hidden_layers;
+	mr->D = model->config->hidden_size;
+	mr->Hq = model->config->num_attention_heads;
+	mr->Hkv = model->config->num_key_value_heads;
+	mr->Df = model->config->intermediate_size;
+	mr->Dh = mr->D / mr->Hq;
+	mr->Dkv = mr->Hkv * mr->Dh;
+
+	int B = mr->B, S = mr->S, D = mr->D, V = mr->V, Dkv = mr->Dkv, Df = mr->Df;
+
+	const float theta = model->config->rope_theta;
+	int half_dim = mr->Dh / 2;
+	mr->rope.freqs = malloc(half_dim * sizeof(float));
+	mr->rope.cosv = malloc(mr->S * half_dim * sizeof(float));
+	mr->rope.sinv = malloc(mr->S * half_dim * sizeof(float));
+	for (int i = 0; i < half_dim; i++) {
+		mr->rope.freqs[i] = 1.0f / powf(theta, (float)i / half_dim);
+	}
+	for (int p = 0; p < mr->S; p++) {
+		for (int i = 0; i < half_dim; i++) {
+			float angle = p * mr->rope.freqs[i];
+			mr->rope.cosv[p * half_dim + i] = cosf(angle);
+			mr->rope.sinv[p * half_dim + i] = sinf(angle);
+		}
+	}
+
+	mr->layer = malloc(mr->L * sizeof(struct LayerContext));
+	for (int l = 0; l < mr->L; l++) {
+	}
+	mr->X_final = malloc(B * S * D * sizeof(float));
+
+	mr->grad.embed = malloc(V * D * sizeof(float));
+	mr->grad.layer = malloc(mr->L * sizeof(struct LayerGrad));
+	for (int l = 0; l < mr->L; l++) {
+		mr->grad.layer[l].norm = malloc(D * sizeof(float));
+		mr->grad.layer[l].Wq = malloc(D * D * sizeof(float));
+		mr->grad.layer[l].Wk = malloc(D * Dkv * sizeof(float));
+		mr->grad.layer[l].Wv = malloc(D * Dkv * sizeof(float));
+		mr->grad.layer[l].Wo = malloc(D * D * sizeof(float));
+		mr->grad.layer[l].post_norm = malloc(D * sizeof(float));
+		mr->grad.layer[l].gate = malloc(D * Df * sizeof(float));
+		mr->grad.layer[l].up = malloc(D * Df * sizeof(float));
+		mr->grad.layer[l].down = malloc(Df * D * sizeof(float));
+	}
+	mr->grad.norm = malloc(D * sizeof(float));
+
+	return mr;
+}
+
+void free_modelrunner(ModelRunner* mr) {
+	free(mr->rope.freqs);
+	free(mr->rope.cosv);
+	free(mr->rope.sinv);
+}
+
+void zero_grad(ModelRunner* mr) {
+	int B = mr->B, S = mr->S, D = mr->D, V = mr->V, L = mr->L, Dkv = mr->Dkv, Df = mr->Df;
+	memset(mr->grad.embed, 0, V * D * sizeof(float));
+	for (int l = 0; l < L; l++) {
+		struct LayerGrad* layer = &mr->grad.layer[l];
+		memset(layer->norm, 0, D * sizeof(float));
+		memset(layer->Wq, 0, D * D * sizeof(float));
+		memset(layer->Wk, 0, D * Dkv * sizeof(float));
+		memset(layer->Wv, 0, D * Dkv * sizeof(float));
+		memset(layer->Wo, 0, D * D * sizeof(float));
+		memset(layer->post_norm, 0, D * sizeof(float));
+		memset(layer->gate, 0, D * Df * sizeof(float));
+		memset(layer->up, 0, D * Df * sizeof(float));
+		memset(layer->down, 0, Df * D * sizeof(float));
+	}
+	memset(mr->grad.norm, 0, D * sizeof(float));
+}
+
+float* model_forward(ModelRunner* mr, const int* inputs, bool grad) {
+	const int B = mr->B;
+	const int S = mr->S;
+	const int v = mr->V;
+	const int D = mr->D;
+	const int Hq = mr->Hq;
+	const int Hkv = mr->Hkv;
+	const int Dh = mr->Dh;
+	const int Dq = mr->D;
+	const int Dkv = mr->Dkv;
+	const int Df = mr->Df;
+
+	int* eos_pos = malloc(B * sizeof(int));
+	for (int b = 0; b < B; b++) {
+		eos_pos[b] = -1;
+		for (int i = 1; i < S; i++) {
+			if (inputs[b * S + i] == 151643) {  // TODO: config
+				eos_pos[b] = i;
+				break;
+			}
 		}
 	}
 
@@ -348,7 +409,7 @@ float* Qwen25_05B_forward(Qwen25_05B_Model* model, const int* inputs, const int 
 	float* Q = malloc(B * S * D * sizeof(float));	      // [B, S, D], or say [B, S, Hq, Dh]
 	float* K = malloc(B * S * Hkv * Dh * sizeof(float));  // [B, S, Hkv, Dh]
 	float* V = malloc(B * S * Hkv * Dh * sizeof(float));  // [B, S, Hkv, Dh]
-	float* Ah = malloc(S * S * sizeof(float));	      // [S, S]
+	float* A = malloc(B * S * S * sizeof(float));	      // [B, S, S], seperate A per batch
 	float* O = malloc(B * S * D * sizeof(float));	      // [B, S, Hq, Dh]
 	float* G = malloc(B * S * Df * sizeof(float));
 	float* U = malloc(B * S * Df * sizeof(float));
@@ -399,6 +460,7 @@ float* Qwen25_05B_forward(Qwen25_05B_Model* model, const int* inputs, const int 
 			float* Qb = Q + b * S * Hq * Dh;   // [S, Hq, Dh]
 			float* Kb = K + b * S * Hkv * Dh;  // [S, Hkv, Dh]
 			float* Vb = V + b * S * Hkv * Dh;  // [S, Hkv, Dh]
+			float* Ab = A + b * S * S;	   // [S, S]
 			float* Ob = O + b * S * Hq * Dh;   // [S, Hq, Dh]
 			for (int h = 0; h < Hq; h++) {
 				int hq = h;
@@ -411,6 +473,7 @@ float* Qwen25_05B_forward(Qwen25_05B_Model* model, const int* inputs, const int 
 							    // lasting Dh, skip Hq*Dh...
 				float* Kh = Kb + hkv * Dh;  // stride = Hkv*Dh
 				float* Vh = Vb + hkv * Dh;
+				float* Ah = Ab;
 				float* Oh = Ob + hq * Dh;
 
 				// Ah = softmax(Q @ K^T / sqrt(Dh) + M)
@@ -419,9 +482,9 @@ float* Qwen25_05B_forward(Qwen25_05B_Model* model, const int* inputs, const int 
 				cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, S, Dh, a, Qh, Hq * Dh, Kh,
 					    Hkv * Dh, 0.0f, Ah, S);
 				// attention mask
-				if (eos_pos >= 0) {
+				if (eos_pos[b] >= 0) {
 					for (int i = 0; i < S; i++) {
-						for (int j = eos_pos + 1; j < S; j++) {
+						for (int j = eos_pos[b] + 1; j < S; j++) {
 							Ah[i * S + j] = -1e9f;
 						}
 					}
@@ -469,28 +532,72 @@ float* Qwen25_05B_forward(Qwen25_05B_Model* model, const int* inputs, const int 
 		}
 	}
 
-	rmsnorm1(&model->norm, X, B, S, D);
-	// X: [B, S, D], E: [V, D]
-	// -> [B, S, V]
-	const float* We = model->embedding.table;
-	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, B * S, v, D, 1.0f, X, D, We, D, 0.0f, logits, v);
-	for (int i = 0; i < B * S; i++) {
-		softmax(logits + i * v, v);
-	}
+	rmsnorm1(&mr->model->norm, X, B, S, D);
+	memcpy(mr->X_final, X, B * S * D * sizeof(float));
 
+	// X: [B, S, D], E: [V, D]
+	// -> logits: [B, S, V]
+	const float* We = mr->model->embedding.table;
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, B * S, v, D, 1.0f, X, D, We, D, 0.0f, logits, v);
+
+	free(eos_pos);
 	free(X);
 	free(R);
 	free(Q);
 	free(K);
 	free(V);
-	free(Ah);
+	free(A);
 	free(O);
 	free(G);
 	free(U);
 	return logits;
 }
 
-int Qwen25_05B_inference(Qwen25_05B_Model* model, const int* tokens, int seq_len) {
+void rmsnorm_backward(float *xhat, float rms, float dim, float *w, float *dy, float *x);
+
+void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
+	Model* m = mr->model;
+	int B = mr->B, S = mr->S, D = mr->D, V = mr->V, L = mr->L, Dkv = mr->Dkv, Df = mr->Df;
+	int BS = B * S;
+	float* dX = malloc(B * S * D * sizeof(float));
+
+	// Y = X @ W_E^T
+	// dW_E^T = X^T @ dY
+	// dW_E = (X^T @ dY)^T = dY^T @ X
+	// dWe = dlogits^T @ X
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, V, D, BS, 1.0f, dlogits, V, mr->X_final, D, 1.0f,
+		    mr->grad.embed, D);
+	// dX = dY @ W_E
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, BS, D, V, 1.0f, dlogits, V, m->embedding.table, D, 0, dX,
+		    D);
+
+	// RMSNorm
+	// y = x / rms * w
+	// x_hat = x / rms
+	// dw = dy * x_hat
+	// dx = (1/rms) * (dy * w - x_hat / d * sum(dy * w * x_hat))
+	for (int i = 0; i < B * S; i++) {
+		float* dy = dX + i * D;
+		float* X_normed = mr->X_normed + i * D;
+		for (int j = 0; j < D; j++) {
+			mr->grad.norm[j] += dy[j] * X_normed[j];
+		}
+
+		float* w = m->norm.weight;
+		float rms = mr->rms;
+		float dim = mr->dim;
+		float sum = 0;
+		for (int j = 0; j < D; j++) {
+			sum += dy[j] * w[j] * X_normed[j];
+		}
+		float* dx = dy;
+		for (int j = 0; j < D; j++) {
+			dx[j] = (1 / rms) * (dy[j] * w[j] - X_normed[j] / dim * sum);
+		}
+	}
+}
+
+int inference(Model* model, const int* tokens, int seq_len) {
 	const int N = seq_len;
 	const int D = model->config->hidden_size;
 	const int Hq = model->config->num_attention_heads;

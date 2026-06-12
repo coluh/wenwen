@@ -99,6 +99,10 @@ void dataloader_next(DataLoader* dl) {
 		memcpy(dl->y + s * dl->seq_len, dl->ds->tokens + offset, (dl->seq_len - 1) * sizeof(int));
 		dl->x[s * dl->seq_len] = 151643;  // TODO: config
 		dl->y[s * dl->seq_len + dl->seq_len - 1] = 151643;
+		// now: x [151643, ...], y [..., 151643]
+		// should be:
+		// x: 151643, 114514, 114514, 151643, -100, -100
+		// y: 114514, 114514, 151643, -100, -100, -100
 	}
 
 	dl->batch_idx++;
