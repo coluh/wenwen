@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #include "data.h"
+#include "optimize.h"
 #include "qwen25.h"
 
 // logits: [B, S, v]
@@ -58,6 +59,8 @@ void train(Model* model, Dataset* dataset, int num_epochs, int batch_size, int m
 	dataloader_init(&val_loader, &val_data, batch_size, max_seq, false);
 
 	ModelRunner* runner = new_modelrunner(model, batch_size, max_seq);
+	AdamW* optimizer = new_optimizer(runner, 3e-4);
+	Scheduler scheduler = {.total_steps = num_epochs * train_loader.batch_count, .step = 0, .lr = &optimizer->lr};
 
 	for (int epoch = 1; epoch <= num_epochs; epoch++) {
 		// train
@@ -75,7 +78,8 @@ void train(Model* model, Dataset* dataset, int num_epochs, int batch_size, int m
 
 			zero_grad(runner);
 			model_backward(runner, inputs, dlogits);
-			/// optimizer.step()
+			optimizer_step(optimizer);
+			scheduler_step(&scheduler);
 
 			train_loss += loss;
 		}
@@ -95,8 +99,6 @@ void train(Model* model, Dataset* dataset, int num_epochs, int batch_size, int m
 		}
 
 		float epoch_val_loss = val_loss / val_loader.batch_count;
-
-		/// scheduler.step(epoch_val_loss)
 
 		printf("Epoch %2d/%2d | Train Loss: %8.4f | Val Loss: %8.4f | LR: %.8e \n", epoch, num_epochs,
 		       epoch_train_loss, epoch_val_loss, 1e-5);

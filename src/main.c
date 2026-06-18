@@ -40,7 +40,7 @@ int main(int argc, char* argv[]) {
 	int outputs_i = 0;
 	while (1) {
 		// printf("\r %d / %d", i, 16);
-		int token = Qwen25_05B_inference(model, tokens, n);
+		int token = inference(model, tokens, n);
 		if (token == config->eos_token_id) {
 			printf("<|eos|>");
 			break;
