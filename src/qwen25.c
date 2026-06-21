@@ -32,93 +32,128 @@ float* malloc_fp32(int rows, int cols, int trans, uint16_t* bf16data) {
 	return p;
 }
 
-void* Qwen25_05B(ModelConfig* config, const char* model_safetensors) {
+// void* new_model(ModelConfig* config, const char* model_safetensors) {
+// 	Model* m = calloc(1, sizeof(Model));
+// 	SafeTensors* sf = load_safetensors(model_safetensors);
+// 	m->config = config;
+// 	m->sf = sf;
+// 	char buffer[64];
+//
+// 	const int V = config->vocab_size;
+// 	const int D = config->hidden_size;
+// 	const int Dh = D / config->num_attention_heads;
+// 	const int Hkv = config->num_key_value_heads;
+// 	const int Df = config->intermediate_size;
+//
+// 	m->embedding.table = malloc_fp32(V, D, 0, get_tensor(sf, "model.embed_tokens.weight"));
+// 	m->embedding.vocab_size = V;
+// 	m->embedding.hidden_dim = D;
+//
+// 	for (int l = 0; l < config->num_hidden_layers; l++) {
+// 		struct Layer* layer = &m->layers[l];
+//
+// 		sprintf(buffer, "model.layers.%d.input_layernorm.weight", l);
+// 		layer->norm.weight = malloc_fp32(D, 1, 0, get_tensor(sf, buffer));
+// 		layer->norm.eps = config->rms_norm_eps;
+//
+// 		sprintf(buffer, "model.layers.%d.self_attn.q_proj.weight", l);
+// 		layer->attention.q.weight = malloc_fp32(D, D, 1, get_tensor(sf, buffer));
+// 		sprintf(buffer, "model.layers.%d.self_attn.q_proj.bias", l);
+// 		layer->attention.q.bias = malloc_fp32(D, 1, 0, get_tensor(sf, buffer));
+//
+// 		sprintf(buffer, "model.layers.%d.self_attn.k_proj.weight", l);
+// 		layer->attention.k.weight = malloc_fp32(D, Hkv * Dh, 1, get_tensor(sf, buffer));
+// 		sprintf(buffer, "model.layers.%d.self_attn.k_proj.bias", l);
+// 		layer->attention.k.bias = malloc_fp32(Hkv * Dh, 1, 0, get_tensor(sf, buffer));
+//
+// 		sprintf(buffer, "model.layers.%d.self_attn.v_proj.weight", l);
+// 		layer->attention.v.weight = malloc_fp32(D, Hkv * Dh, 1, get_tensor(sf, buffer));
+// 		sprintf(buffer, "model.layers.%d.self_attn.v_proj.bias", l);
+// 		layer->attention.v.bias = malloc_fp32(Hkv * Dh, 1, 0, get_tensor(sf, buffer));
+//
+// 		sprintf(buffer, "model.layers.%d.self_attn.o_proj.weight", l);
+// 		layer->attention.o.weight = malloc_fp32(D, D, 1, get_tensor(sf, buffer));
+//
+// 		sprintf(buffer, "model.layers.%d.post_attention_layernorm.weight", l);
+// 		layer->post_norm.weight = malloc_fp32(D, 1, 0, get_tensor(sf, buffer));
+// 		layer->post_norm.eps = config->rms_norm_eps;
+//
+// 		sprintf(buffer, "model.layers.%d.mlp.gate_proj.weight", l);
+// 		layer->mlp.gate.weight = malloc_fp32(D, Df, 1, get_tensor(sf, buffer));
+// 		sprintf(buffer, "model.layers.%d.mlp.up_proj.weight", l);
+// 		layer->mlp.up.weight = malloc_fp32(D, Df, 1, get_tensor(sf, buffer));
+// 		sprintf(buffer, "model.layers.%d.mlp.down_proj.weight", l);
+// 		layer->mlp.down.weight = malloc_fp32(Df, D, 1, get_tensor(sf, buffer));
+// 	}
+//
+// 	m->norm.weight = malloc_fp32(D, 1, 0, get_tensor(sf, "model.norm.weight"));
+// 	m->norm.eps = config->rms_norm_eps;
+//
+// 	m->max_seq = 512;  // TODO: config this!
+// 	int size = config->num_hidden_layers * Hkv * m->max_seq * Dh;
+// 	m->k_cache = malloc(size * sizeof(float));
+// 	m->v_cache = malloc(size * sizeof(float));
+// 	m->cache_seq_len = 0;
+//
+// 	free_safetensors(m->sf);
+// 	return m;
+// }
+
+Model* new_model(const ModelConfig* config) {
 	Model* m = calloc(1, sizeof(Model));
-	SafeTensors* sf = load_safetensors(model_safetensors);
 	m->config = config;
-	m->sf = sf;
-	char buffer[64];
 
 	const int V = config->vocab_size;
 	const int D = config->hidden_size;
-	const int Dh = D / config->num_attention_heads;
-	const int Hkv = config->num_key_value_heads;
+	const int L = config->num_hidden_layers;
+	const int Dkv = D / config->num_attention_heads * config->num_key_value_heads;
 	const int Df = config->intermediate_size;
 
-	m->embedding.table = malloc_fp32(V, D, 0, get_tensor(sf, "model.embed_tokens.weight"));
+	m->embedding.table = calloc(V * D, sizeof(float));
 	m->embedding.vocab_size = V;
 	m->embedding.hidden_dim = D;
-
-	for (int l = 0; l < config->num_hidden_layers; l++) {
+	m->layers = calloc(L, sizeof(struct Layer));
+	for (int l = 0; l < L; l++) {
 		struct Layer* layer = &m->layers[l];
-
-		sprintf(buffer, "model.layers.%d.input_layernorm.weight", l);
-		layer->norm.weight = malloc_fp32(D, 1, 0, get_tensor(sf, buffer));
+		layer->norm.weight = calloc(D, sizeof(float));
 		layer->norm.eps = config->rms_norm_eps;
-
-		sprintf(buffer, "model.layers.%d.self_attn.q_proj.weight", l);
-		layer->attention.q.weight = malloc_fp32(D, D, 1, get_tensor(sf, buffer));
-		sprintf(buffer, "model.layers.%d.self_attn.q_proj.bias", l);
-		layer->attention.q.bias = malloc_fp32(D, 1, 0, get_tensor(sf, buffer));
-
-		sprintf(buffer, "model.layers.%d.self_attn.k_proj.weight", l);
-		layer->attention.k.weight = malloc_fp32(D, Hkv * Dh, 1, get_tensor(sf, buffer));
-		sprintf(buffer, "model.layers.%d.self_attn.k_proj.bias", l);
-		layer->attention.k.bias = malloc_fp32(Hkv * Dh, 1, 0, get_tensor(sf, buffer));
-
-		sprintf(buffer, "model.layers.%d.self_attn.v_proj.weight", l);
-		layer->attention.v.weight = malloc_fp32(D, Hkv * Dh, 1, get_tensor(sf, buffer));
-		sprintf(buffer, "model.layers.%d.self_attn.v_proj.bias", l);
-		layer->attention.v.bias = malloc_fp32(Hkv * Dh, 1, 0, get_tensor(sf, buffer));
-
-		sprintf(buffer, "model.layers.%d.self_attn.o_proj.weight", l);
-		layer->attention.o.weight = malloc_fp32(D, D, 1, get_tensor(sf, buffer));
-
-		sprintf(buffer, "model.layers.%d.post_attention_layernorm.weight", l);
-		layer->post_norm.weight = malloc_fp32(D, 1, 0, get_tensor(sf, buffer));
+		layer->attention.q.weight = calloc(D * D, sizeof(float));
+		layer->attention.k.weight = calloc(D * Dkv, sizeof(float));
+		layer->attention.v.weight = calloc(D * Dkv, sizeof(float));
+		layer->attention.o.weight = calloc(D * D, sizeof(float));
+		layer->post_norm.weight = calloc(D, sizeof(float));
 		layer->post_norm.eps = config->rms_norm_eps;
-
-		sprintf(buffer, "model.layers.%d.mlp.gate_proj.weight", l);
-		layer->mlp.gate.weight = malloc_fp32(D, Df, 1, get_tensor(sf, buffer));
-		sprintf(buffer, "model.layers.%d.mlp.up_proj.weight", l);
-		layer->mlp.up.weight = malloc_fp32(D, Df, 1, get_tensor(sf, buffer));
-		sprintf(buffer, "model.layers.%d.mlp.down_proj.weight", l);
-		layer->mlp.down.weight = malloc_fp32(Df, D, 1, get_tensor(sf, buffer));
+		layer->mlp.gate.weight = calloc(D * Df, sizeof(float));
+		layer->mlp.up.weight = calloc(D * Df, sizeof(float));
+		layer->mlp.down.weight = calloc(Df * D, sizeof(float));
 	}
-
-	m->norm.weight = malloc_fp32(D, 1, 0, get_tensor(sf, "model.norm.weight"));
+	m->norm.weight = calloc(D, sizeof(float));
 	m->norm.eps = config->rms_norm_eps;
 
-	m->max_seq = 512;  // TODO: config this!
-	int size = config->num_hidden_layers * Hkv * m->max_seq * Dh;
-	m->k_cache = malloc(size * sizeof(float));
-	m->v_cache = malloc(size * sizeof(float));
-	m->cache_seq_len = 0;
-
-	free_safetensors(m->sf);
 	return m;
 }
 
-void Qwen25_05B_free(Model* model) {
+void free_model(Model* model) {
 	free(model->embedding.table);
 	for (int l = 0; l < model->config->num_hidden_layers; l++) {
 		struct Layer* layer = &model->layers[l];
 		free(layer->norm.weight);
 		free(layer->attention.q.weight);
-		free(layer->attention.q.bias);
+		// free(layer->attention.q.bias);
 		free(layer->attention.k.weight);
-		free(layer->attention.k.bias);
+		// free(layer->attention.k.bias);
 		free(layer->attention.v.weight);
-		free(layer->attention.v.bias);
+		// free(layer->attention.v.bias);
 		free(layer->attention.o.weight);
 		free(layer->post_norm.weight);
 		free(layer->mlp.gate.weight);
 		free(layer->mlp.up.weight);
 		free(layer->mlp.down.weight);
 	}
+	free(model->layers);
 	free(model->norm.weight);
-	free(model->k_cache);
-	free(model->v_cache);
+	// free(model->k_cache);
+	// free(model->v_cache);
 	free(model);
 }
 
@@ -260,6 +295,7 @@ void rope1(struct RoPE* rope, float* T, int B, int S, int H, int Dh, bool revers
 
 ModelRunner* new_modelrunner(Model* model, int batch_size, int max_seq_len) {
 	ModelRunner* mr = malloc(sizeof(ModelRunner));
+	mr->model = model;
 
 	mr->B = batch_size;
 	mr->S = max_seq_len;
@@ -273,9 +309,9 @@ ModelRunner* new_modelrunner(Model* model, int batch_size, int max_seq_len) {
 	mr->Dq = mr->D;
 	mr->Dkv = mr->Hkv * mr->Dh;
 
-	int B = mr->B, S = mr->S, D = mr->D, Dkv = mr->Dkv, V = mr->V, Df = mr->Df;
+	const int B = mr->B, S = mr->S, D = mr->D, Dkv = mr->Dkv, V = mr->V, Df = mr->Df;
 
-	// middle variables for backward
+	// middle variables stored in forward, used in backward
 	for (int l = 0; l < mr->L; l++) {
 		struct Layer* layer = &model->layers[l];
 		layer->norm.ctx.X_normed = malloc(B * S * D * sizeof(float));
@@ -314,6 +350,9 @@ ModelRunner* new_modelrunner(Model* model, int batch_size, int max_seq_len) {
 			mr->rope.sinv[p * half_dim + i] = sinf(angle);
 		}
 	}
+
+	// to avoid allocating every time
+	mr->ctx.dlogits = calloc((size_t)B * S * V, sizeof(float));
 
 	mr->grad.embed = malloc(V * D * sizeof(float));
 	mr->grad.layer = malloc(mr->L * sizeof(struct LayerGrad));
@@ -359,6 +398,7 @@ void free_modelrunner(ModelRunner* mr) {
 	free(mr->model->norm.ctx.X_normed);
 	free(mr->model->norm.ctx.rms);
 	free(mr->model->X_final);
+	free(mr->ctx.dlogits);
 	free(mr->grad.embed);
 	for (int l = 0; l < mr->L; l++) {
 		free(mr->grad.layer[l].norm);
@@ -373,6 +413,7 @@ void free_modelrunner(ModelRunner* mr) {
 	}
 	free(mr->grad.layer);
 	free(mr->grad.norm);
+	free(mr);
 }
 
 void zero_grad(ModelRunner* mr) {
@@ -417,14 +458,7 @@ float* model_forward(ModelRunner* mr, const int* inputs, bool grad) {
 	}
 
 	float* X = malloc(B * S * D * sizeof(float));
-	// float* Q = malloc(B * S * D * sizeof(float));	      // [B, S, D], or say [B, S, Hq, Dh]
-	// float* K = malloc(B * S * Hkv * Dh * sizeof(float));  // [B, S, Hkv, Dh]
-	// float* V = malloc(B * S * Hkv * Dh * sizeof(float));  // [B, S, Hkv, Dh]
-	// float* A = malloc(B * S * S * sizeof(float));	      // [B, S, S], seperate A per batch
-	// float* O = malloc(B * S * D * sizeof(float));	      // [B, S, Hq, Dh]
-	// float* G = malloc(B * S * Df * sizeof(float));
-	// float* U = malloc(B * S * Df * sizeof(float));
-	float* logits = malloc(B * S * v * sizeof(float));
+	float* logits = malloc((size_t)B * S * v * sizeof(float));
 
 	// embed tokens
 	// inputs: [B, S]
@@ -570,29 +604,31 @@ float* model_forward(ModelRunner* mr, const int* inputs, bool grad) {
 	return logits;
 }
 
-void rmsnorm_backward(RMSNorm* n, float* dy, float* X_normed, float* out_grad, float* out_dx) {
+void rmsnorm_backward(RMSNorm* n, float* dy, float* out_grad, float* out_dx, int N) {
 	const int D = n->ctx.dim;
-	for (int j = 0; j < D; j++) {
-		out_grad[j] += dy[j] * X_normed[j];
-	}
+	for (int i = 0; i < N; i++) {
+		const float* dY = dy + i * D;
+		const float* X_normed = n->ctx.X_normed + i * D;
+		float* out_dX = out_dx + i * D;
 
-	float* w = n->weight;
-	float rms = n->ctx.rms;
-	float dim = n->ctx.dim;
-	float sum = 0;
-	for (int j = 0; j < D; j++) {
-		sum += dy[j] * w[j] * X_normed[j];
-	}
-	float* dx = dy;
-	for (int j = 0; j < D; j++) {
-		dx[j] = (1 / rms) * (dy[j] * w[j] - X_normed[j] / dim * sum);
+		for (int j = 0; j < D; j++) {
+			out_grad[j] += dY[j] * X_normed[j];
+		}
+
+		const float* w = n->weight;
+		const float rms = n->ctx.rms[i];
+		float sum = 0;
+		for (int j = 0; j < D; j++) {
+			sum += dY[j] * w[j] * X_normed[j];
+		}
+		for (int j = 0; j < D; j++) {
+			out_dX[j] = (1 / rms) * (dY[j] * w[j] - X_normed[j] / D * sum);
+		}
 	}
 }
 
-void ffn_backward(float* dY, struct FFN* ffn, float* out_dWg, float* out_dWu, float* out_dWd, float* out_dX, int N,
+void ffn_backward(struct FFN* ffn, float* dY, float* out_dWg, float* out_dWu, float* out_dWd, float* out_dX, int N,
 		  int D, int Df) {
-	// TODO: residual
-
 	// Y = (SiLU(X @ Wg) x (X @ Wu)) @ Wd
 	// let H be (SiLU(X @ Wg) x (X @ Wu))
 	float* dH = malloc(N * Df * sizeof(float));
@@ -603,11 +639,11 @@ void ffn_backward(float* dY, struct FFN* ffn, float* out_dWg, float* out_dWu, fl
 
 	// let G_act = SiLU(G)
 	// H = G_act x U => dG_act = dH x U, dU = dH x G_act
-	float* dG_act = out_dWg;
-	float* dU = out_dWu;
-	float* dG = out_dWg;
-	for (int i = 0; i < N; i++) {
-		dG_act[i] = dH[i] * ffn->ctx.U[i];  // [D, Df]
+	// float* dG_act = malloc(N * Df * sizeof(float));
+	float* dU = malloc(N * Df * sizeof(float));
+	float* dG = malloc(N * Df * sizeof(float));
+	for (int i = 0; i < N * Df; i++) {
+		float dG_act = dH[i] * ffn->ctx.U[i];
 		dU[i] = dH[i] * ffn->ctx.G_act[i];
 
 		// SiLU(x) = x / (1 + e^(-x)) => dSiLU/dx = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
@@ -615,7 +651,7 @@ void ffn_backward(float* dY, struct FFN* ffn, float* out_dWg, float* out_dWu, fl
 		float g = ffn->ctx.G[i];
 		float sig = 1.0f / (1.0f + expf(-g));
 		float dsilu = sig * (1 + g * (1 - sig));
-		dG[i] = dG_act[i] * dsilu;
+		dG[i] = dG_act * dsilu;
 	}
 
 	// G = X @ Wg => dWg = X^T @ dG, dX = dG @ Wg^T
@@ -623,10 +659,13 @@ void ffn_backward(float* dY, struct FFN* ffn, float* out_dWg, float* out_dWu, fl
 	float* X = ffn->ctx.X_in;
 	float* Wg = ffn->gate.weight;
 	float* Wu = ffn->up.weight;
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, N, Df, 1.0f, X, N, dG, Df, 0.0f, out_dWg, Df);
-	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, Df, 1.0f, dG, Df, Wg, Df, 1.0f, out_dX, D);
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, N, Df, 1.0f, X, N, dU, Df, 0.0f, out_dWu, Df);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Df, N, 1.0f, X, D, dG, Df, 0.0f, out_dWg, Df);
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, Df, 1.0f, dG, Df, Wg, Df, 0.0f, out_dX, D);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Df, N, 1.0f, X, D, dU, Df, 0.0f, out_dWu, Df);
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, Df, 1.0f, dU, Df, Wu, Df, 1.0f, out_dX, D);
+	free(dH);
+	free(dU);
+	free(dG);
 }
 
 void attention_backward(struct Attention* att, float* dY, float* out_dWq, float* out_dWk, float* out_dWv,
@@ -645,6 +684,7 @@ void attention_backward(struct Attention* att, float* dY, float* out_dWq, float*
 	float* dV = calloc(B * S * Hkv * Dh, sizeof(float));
 	float* dQ = calloc(B * S * Hq * Dh, sizeof(float));
 	float* dK = calloc(B * S * Hkv * Dh, sizeof(float));
+	float* dP = malloc(S * S * sizeof(float));  // [S, S]
 
 	for (int b = 0; b < B; b++) {
 		for (int h = 0; h < Hq; h++) {
@@ -655,7 +695,6 @@ void attention_backward(struct Attention* att, float* dY, float* out_dWq, float*
 			float* V = att->ctx.V + (b * S * Hkv * Dh + hkv * Dh);	// [S, Dh], ld=Hkv*Dh
 			float* dOh = dO + (b * S * Hq * Dh + hq * Dh);		// [S, Dh], ld=Hq*Dh
 			float* dVh = dV + (b * S * Hkv * Dh + hkv * Dh);	// [S, Dh], ld=Hkv*Dh
-			float* dP = malloc(S * S * sizeof(float));		// [S, S]
 			cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, S, Dh, S, 1.0f, P, S, dOh, Hq * Dh, 0.0f,
 				    dVh, Hkv * Dh);
 			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, S, Dh, 1.0f, dOh, Hq * Dh, V, Hkv * Dh,
@@ -679,10 +718,10 @@ void attention_backward(struct Attention* att, float* dY, float* out_dWq, float*
 			float* K = att->ctx.K + b * S * Hkv * Dh + hkv * Dh;  // [S, Dh], ld=Hkv*Dh
 			float* dQh = dQ + b * S * Hq * Dh + hq * Dh;	      // [S, Dh], ld=Hq*Dh
 			float* dKh = dK + b * S * Hkv * Dh + hkv * Dh;	      // [S, Dh], ld=Hkv*Dh
-			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, S, Dh, S, 1.0f, dA, S, K, Hkv * Dh, 0.0f,
+			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, S, Dh, S, a, dA, S, K, Hkv * Dh, 0.0f,
 				    dQh, Hq * Dh);
-			cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, S, Dh, S, 1.0f, dA, S, Q, Hq * Dh, 0.0f,
-				    dKh, Hkv * Dh);
+			cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, S, Dh, S, a, dA, S, Q, Hq * Dh, 0.0f, dKh,
+				    Hkv * Dh);
 		}
 	}
 
@@ -695,9 +734,14 @@ void attention_backward(struct Attention* att, float* dY, float* out_dWq, float*
 	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Dkv, N, 1.0f, X, D, dK, Dkv, 0.0f, out_dWk, Dkv);
 	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Dkv, N, 1.0f, X, D, dV, Dkv, 0.0f, out_dWv, Dkv);
 	float *Wq = att->q.weight, *Wk = att->k.weight, *Wv = att->v.weight;
-	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, D, 1.0f, dQ, D, Wq, D, 1.0f, out_dX, D);
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, D, 1.0f, dQ, D, Wq, D, 0.0f, out_dX, D);
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, Dkv, 1.0f, dK, Dkv, Wk, Dkv, 1.0f, out_dX, D);
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, Dkv, 1.0f, dV, Dkv, Wv, Dkv, 1.0f, out_dX, D);
+	free(dO);
+	free(dQ);
+	free(dK);
+	free(dV);
+	free(dP);
 }
 
 void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
@@ -705,6 +749,7 @@ void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
 	int B = mr->B, S = mr->S, D = mr->D, V = mr->V, L = mr->L, Df = mr->Df;
 	int BS = B * S;
 	float* dX = malloc(B * S * D * sizeof(float));
+	float* dX_res = malloc(BS * D * sizeof(float));
 
 	// Y = X @ W_E^T
 	//   => dW_E^T = X^T @ dY
@@ -720,33 +765,23 @@ void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
 	// y = x / rms * w, x_hat = x / rms
 	//   => dw = dy * x_hat
 	//      dx = (1/rms) * (dy * w - x_hat / d * sum(dy * w * x_hat))
-	for (int i = 0; i < B * S; i++) {
-		float* Xn = mr->model->norm.ctx.X_normed + i * D;
-		rmsnorm_backward(&mr->model->norm, dX + i * D, Xn, mr->grad.norm, dX + i * D);
-	}
+	rmsnorm_backward(&mr->model->norm, dX, mr->grad.norm, dX, B * S);
 
 	for (int l = L - 1; l >= 0; l--) {
 		struct Layer* layer = &mr->model->layers[l];
 		struct LayerGrad* grad = &mr->grad.layer[l];
 
 		struct FFN* ffn = &mr->model->layers[l].mlp;
-		float* dX_res = malloc(BS * D * sizeof(float));
 		memcpy(dX_res, dX, B * S * D * sizeof(float));
-		ffn_backward(dX, ffn, grad->gate, grad->up, grad->down, dX, BS, D, Df);
-		for (int i = 0; i < BS; i++) {
-			float* Xn = layer->post_norm.ctx.X_normed + i * D;
-			rmsnorm_backward(&layer->post_norm, dX + i * D, Xn, grad->post_norm, dX + i * D);
-		}
+		ffn_backward(ffn, dX, grad->gate, grad->up, grad->down, dX, BS, D, Df);
+		rmsnorm_backward(&layer->post_norm, dX, grad->post_norm, dX, B * S);
 		for (int i = 0; i < B * S * D; i++) {
 			dX[i] += dX_res[i];
 		}
 
 		memcpy(dX_res, dX, B * S * D * sizeof(float));
 		attention_backward(&layer->attention, dX, grad->Wq, grad->Wk, grad->Wv, grad->Wo, dX, &mr->rope);
-		for (int i = 0; i < BS; i++) {
-			float* Xn = layer->norm.ctx.X_normed + i * D;
-			rmsnorm_backward(&layer->norm, dX + i * D, Xn, grad->norm, dX + i * D);
-		}
+		rmsnorm_backward(&layer->norm, dX, grad->norm, dX, B * S);
 		for (int i = 0; i < B * S * D; i++) {
 			dX[i] += dX_res[i];
 		}
@@ -763,6 +798,48 @@ void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
 	}
 
 	free(dX);
+	free(dX_res);
+}
+
+// logits: [B, S, v]
+// labels: [B, S]
+float criterion(float* logits, int* labels, int B, int S, int V, float* grad) {
+	printf("criterion\n");
+	float loss = 0.0f;
+	int count = 0;
+
+	for (int i = 0; i < B * S; i++) {
+		int token = labels[i];
+		if (token == -100) continue;
+
+		// combine softmax and cross entropy
+		// L = -log(softmax(z)_y)
+		//   = -(z_y - log(sum(e^z)))
+		float max_val = logits[(size_t)i * V];
+		for (int v = 0; v < V; v++) {
+			if (logits[(size_t)i * V + v] > max_val) {
+				max_val = logits[i * V + v];
+			}
+		}
+		float sum_exp = 0.0f;
+		for (int v = 0; v < V; v++) {
+			sum_exp += expf(logits[(size_t)i * V + v] - max_val);
+		}
+
+		if (grad) {
+			float* dlogits = grad + i * V;
+			for (int v = 0; v < V; v++) {
+				dlogits[v] = expf(logits[(size_t)i * V + v] - max_val) / sum_exp;
+			}
+			dlogits[token] -= 1.0f;
+		}
+
+		loss += -(logits[(size_t)i * V + token] - max_val) + logf(sum_exp);
+		count++;
+	}
+
+	if (count == 0) return 0.0f;
+	return loss / count;
 }
 
 int inference(Model* model, const int* tokens, int seq_len) {

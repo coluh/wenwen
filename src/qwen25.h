@@ -61,7 +61,7 @@ typedef struct Model {
 			} ctx;
 		} mlp;
 
-	} layers[24];
+	}* layers;
 	RMSNorm norm;
 	// middle variables for backward
 	float* X_final;	 // [B, S, D]
@@ -76,8 +76,8 @@ typedef struct Model {
 	SafeTensors* sf;
 } Model;
 
-void* Qwen25_05B(ModelConfig* config, const char* model_safetensors);
-void Qwen25_05B_free(Model* model);
+Model* new_model(const ModelConfig* config);
+void free_model(Model* model);
 
 typedef struct ModelRunner {
 	Model* model;
@@ -89,6 +89,12 @@ typedef struct ModelRunner {
 		float* cosv;
 		float* sinv;
 	} rope;
+
+	// some middle variables to avoid re-alloc
+	// dlogits, dH, dG, dU, dO, dP, dV, dQ, dK
+	struct {
+		float* dlogits;	 // [B, S, V]
+	} ctx;
 
 	// grads for every paramater
 	struct {
@@ -121,6 +127,8 @@ float* model_forward(ModelRunner* mr, const int* inputs, bool grad);
 // inputs: [batch_size, max_seq_len]
 // dlogits: [batch_size, max_seq_len, vocab_size]
 void model_backward(ModelRunner* mr, const int* inputs, float* dlogits);
+
+float criterion(float* logits, int* labels, int B, int S, int V, float* grad);
 
 // return token id
 int inference(Model* model, const int* tokens, int n_tokens);
