@@ -6,13 +6,24 @@ CFLAGS += -Wall -Wextra -Wpedantic
 # cflags += -O2
 cflags += -fsanitize=address -g
 
-.PHONY: clean run
+test_srcs := $(filter-out src/main.c, $(srcs)) test/overfit.c
+test_target := overfit_test.out
+
+.PHONY: all clean run test
+
+all: $(target) $(test_target)
 
 $(target): $(srcs)
-	clang $(cflags) $(srcs) -o $(target)
+	clang $(cflags) $^ -o $(target)
 
 run: $(target)
-	./$(target)
+	./$(target) train
+
+$(test_target): $(test_srcs)
+	clang $(cflags) $^ -o $(test_target)
+
+test: $(test_target)
+	./$(test_target)
 
 clean:
-	rm -f $(target)
+	rm -f $(target) $(test_target)

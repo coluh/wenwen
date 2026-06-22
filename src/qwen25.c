@@ -99,6 +99,47 @@ float* malloc_fp32(int rows, int cols, int trans, uint16_t* bf16data) {
 // 	return m;
 // }
 
+float randn() {
+	float u1 = (float)rand() / (float)RAND_MAX;
+	float u2 = (float)rand() / (float)RAND_MAX;
+	return sqrtf(-2.0f * logf(u1 + 1e-10f)) * cosf(2.0f * M_PI * u2);
+}
+
+void init_normal(float* w, int n, float std) {
+	for (int i = 0; i < n; i++) {
+		w[i] = randn() * std;
+	}
+}
+
+void init_uniform(float* w, int n, float u) {
+	for (int i = 0; i < n; i++) {
+		w[i] = u;
+	}
+}
+
+void init_params(Model* m) {
+	int V = m->config->vocab_size, D = m->config->hidden_size, L = m->config->num_hidden_layers;
+	int Dkv = m->config->hidden_size / m->config->num_attention_heads * m->config->num_key_value_heads;
+	int Df = m->config->intermediate_size;
+	float std_normal = 0.02f;
+	float std_scaled = 0.02f / sqrtf(2.0f * L);
+
+	init_normal(m->embedding.table, V * D, std_normal);
+	for (int l = 0; l < L; l++) {
+		struct Layer* ly = &m->layers[l];
+		init_uniform(ly->norm.weight, D, 1.0f);
+		init_normal(ly->attention.q.weight, D * D, std_normal);
+		init_normal(ly->attention.k.weight, D * Dkv, std_normal);
+		init_normal(ly->attention.v.weight, D * Dkv, std_normal);
+		init_normal(ly->attention.o.weight, D * D, std_scaled);
+		init_uniform(ly->post_norm.weight, D, 1.0f);
+		init_normal(ly->mlp.gate.weight, D * Df, std_normal);
+		init_normal(ly->mlp.up.weight, D * Df, std_normal);
+		init_normal(ly->mlp.down.weight, Df * D, std_scaled);
+	}
+	init_uniform(m->norm.weight, D, 1.0f);
+}
+
 Model* new_model(const ModelConfig* config) {
 	Model* m = calloc(1, sizeof(Model));
 	m->config = config;
@@ -129,6 +170,8 @@ Model* new_model(const ModelConfig* config) {
 	}
 	m->norm.weight = calloc(D, sizeof(float));
 	m->norm.eps = config->rms_norm_eps;
+
+	init_params(m);
 
 	return m;
 }
@@ -309,7 +352,7 @@ ModelRunner* new_modelrunner(Model* model, int batch_size, int max_seq_len) {
 	mr->Dq = mr->D;
 	mr->Dkv = mr->Hkv * mr->Dh;
 
-	const int B = mr->B, S = mr->S, D = mr->D, Dkv = mr->Dkv, V = mr->V, Df = mr->Df;
+	const int B = mr->B, S = mr->S, D = mr->D, Dkv = mr->Dkv, V = mr->V, Df = mr->Df, Hq = mr->Hq;
 
 	// middle variables stored in forward, used in backward
 	for (int l = 0; l < mr->L; l++) {
@@ -321,7 +364,7 @@ ModelRunner* new_modelrunner(Model* model, int batch_size, int max_seq_len) {
 		layer->attention.ctx.K = malloc(B * S * Dkv * sizeof(float));
 		layer->attention.ctx.V = malloc(B * S * Dkv * sizeof(float));
 		layer->attention.ctx.A = malloc(B * S * S * sizeof(float));
-		layer->attention.ctx.P = malloc(B * S * S * sizeof(float));
+		layer->attention.ctx.P = malloc(B * Hq * S * S * sizeof(float));
 		layer->attention.ctx.O = malloc(B * S * D * sizeof(float));
 		layer->post_norm.ctx.X_normed = malloc(B * S * D * sizeof(float));
 		layer->post_norm.ctx.rms = malloc(B * S * sizeof(float));
@@ -482,9 +525,9 @@ float* model_forward(ModelRunner* mr, const int* inputs, bool grad) {
 		float* O = mr->model->layers[l].attention.ctx.O;
 		float* X_ffn = mr->model->layers[l].mlp.ctx.X_in;
 		float* G = mr->model->layers[l].mlp.ctx.G;
-		float* G_act = mr->model->layers[l].mlp.ctx.U;
+		float* G_act = mr->model->layers[l].mlp.ctx.G_act;
 		float* U = mr->model->layers[l].mlp.ctx.U;
-		float* H = mr->model->layers[l].mlp.ctx.U;
+		float* H = mr->model->layers[l].mlp.ctx.H;
 		float* Wq = mr->model->layers[l].attention.q.weight;  // [D, D] = [D, Hq*Dh]
 		float* Wk = mr->model->layers[l].attention.k.weight;  // [D, Hkv*Dh]
 		float* Wv = mr->model->layers[l].attention.v.weight;  // [D, Hkv*Dh]
@@ -492,6 +535,13 @@ float* model_forward(ModelRunner* mr, const int* inputs, bool grad) {
 		float* Wg = mr->model->layers[l].mlp.gate.weight;     // [D, Df]
 		float* Wu = mr->model->layers[l].mlp.up.weight;	      // [D, Df]
 		float* Wd = mr->model->layers[l].mlp.down.weight;     // [Df, D]
+
+		// fill some ctx
+		mr->model->layers[l].attention.ctx.B = B;
+		mr->model->layers[l].attention.ctx.S = S;
+		mr->model->layers[l].attention.ctx.Hq = Hq;
+		mr->model->layers[l].attention.ctx.Hkv = Hkv;
+		mr->model->layers[l].attention.ctx.Dh = Dh;
 
 		// save for residual
 		memcpy(X_att, X, B * S * D * sizeof(float));
@@ -518,7 +568,7 @@ float* model_forward(ModelRunner* mr, const int* inputs, bool grad) {
 			float* Kb = K + b * S * Hkv * Dh;  // [S, Hkv, Dh]
 			float* Vb = V + b * S * Hkv * Dh;  // [S, Hkv, Dh]
 			float* Ab = A + b * S * S;	   // [S, S]
-			float* Pb = P + b * S * S;	   // [S, S]
+			float* Pb = P + b * Hq * S * S;	   // [S, S]
 			float* Ob = O + b * S * Hq * Dh;   // [S, Hq, Dh]
 			for (int h = 0; h < Hq; h++) {
 				int hq = h;
@@ -532,7 +582,7 @@ float* model_forward(ModelRunner* mr, const int* inputs, bool grad) {
 				float* Kh = Kb + hkv * Dh;  // stride = Hkv*Dh
 				float* Vh = Vb + hkv * Dh;
 				float* Ah = Ab;
-				float* Ph = Pb;
+				float* Ph = Pb + hq * S * S;
 				float* Oh = Ob + hq * Dh;
 
 				// Ah = softmax(Q @ K^T / sqrt(Dh) + M)
@@ -604,6 +654,14 @@ float* model_forward(ModelRunner* mr, const int* inputs, bool grad) {
 	return logits;
 }
 
+void debug_print_norm_n(float* v, const char* name, int n) {
+#ifndef NDEBUG
+	// float grad_norm = 0;
+	// for (int i = 0; i < n; i++) grad_norm += v[i];
+	// printf("%s norm: %e\n", name, grad_norm);
+#endif
+}
+
 void rmsnorm_backward(RMSNorm* n, float* dy, float* out_grad, float* out_dx, int N) {
 	const int D = n->ctx.dim;
 	for (int i = 0; i < N; i++) {
@@ -634,7 +692,7 @@ void ffn_backward(struct FFN* ffn, float* dY, float* out_dWg, float* out_dWu, fl
 	float* dH = malloc(N * Df * sizeof(float));
 
 	// Y = H @ Wd => dWd = H^T @ dY, dH = dY @ Wd^T
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, Df, D, N, 1.0f, ffn->ctx.H, Df, dY, D, 0.0f, out_dWd, D);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, Df, D, N, 1.0f, ffn->ctx.H, Df, dY, D, 1.0f, out_dWd, D);
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, Df, D, 1.0f, dY, D, ffn->down.weight, D, 0.0f, dH, Df);
 
 	// let G_act = SiLU(G)
@@ -659,9 +717,9 @@ void ffn_backward(struct FFN* ffn, float* dY, float* out_dWg, float* out_dWu, fl
 	float* X = ffn->ctx.X_in;
 	float* Wg = ffn->gate.weight;
 	float* Wu = ffn->up.weight;
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Df, N, 1.0f, X, D, dG, Df, 0.0f, out_dWg, Df);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Df, N, 1.0f, X, D, dG, Df, 1.0f, out_dWg, Df);
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, Df, 1.0f, dG, Df, Wg, Df, 0.0f, out_dX, D);
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Df, N, 1.0f, X, D, dU, Df, 0.0f, out_dWu, Df);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Df, N, 1.0f, X, D, dU, Df, 1.0f, out_dWu, Df);
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, Df, 1.0f, dU, Df, Wu, Df, 1.0f, out_dX, D);
 	free(dH);
 	free(dU);
@@ -678,24 +736,29 @@ void attention_backward(struct Attention* att, float* dY, float* out_dWq, float*
 
 	float* O = att->ctx.O;
 	float* Wo = att->o.weight;
+	debug_print_norm_n(dY, "dY", N * D);
+	debug_print_norm_n(O, "O", N * D);
+	debug_print_norm_n(Wo, "Wo", D * D);
 	float* dO = malloc(B * S * D * sizeof(float));
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, D, N, 1.0f, O, D, dY, D, 0.0f, out_dWo, D);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, D, N, 1.0f, O, D, dY, D, 1.0f, out_dWo, D);
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, D, 1.0f, dY, D, Wo, D, 0.0f, dO, D);
+	debug_print_norm_n(out_dWo, "out grad Wo", D * D);
+	debug_print_norm_n(dO, "dO", N * D);
 	float* dV = calloc(B * S * Hkv * Dh, sizeof(float));
 	float* dQ = calloc(B * S * Hq * Dh, sizeof(float));
 	float* dK = calloc(B * S * Hkv * Dh, sizeof(float));
-	float* dP = malloc(S * S * sizeof(float));  // [S, S]
+	float* dP = malloc(S * S * sizeof(float));
 
 	for (int b = 0; b < B; b++) {
 		for (int h = 0; h < Hq; h++) {
 			int hq = h, hkv = h * Hkv / Hq;
 
 			// O = P @ V => dV = P^T @ dOh, dP = dOh @ V^T
-			float* P = att->ctx.P + ((b * Hq + h) * S * S);		// [S, S]
+			float* P = att->ctx.P + ((b * Hq + hq) * S * S);	// [S, S]
 			float* V = att->ctx.V + (b * S * Hkv * Dh + hkv * Dh);	// [S, Dh], ld=Hkv*Dh
 			float* dOh = dO + (b * S * Hq * Dh + hq * Dh);		// [S, Dh], ld=Hq*Dh
 			float* dVh = dV + (b * S * Hkv * Dh + hkv * Dh);	// [S, Dh], ld=Hkv*Dh
-			cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, S, Dh, S, 1.0f, P, S, dOh, Hq * Dh, 0.0f,
+			cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, S, Dh, S, 1.0f, P, S, dOh, Hq * Dh, 1.0f,
 				    dVh, Hkv * Dh);
 			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, S, Dh, 1.0f, dOh, Hq * Dh, V, Hkv * Dh,
 				    0.0f, dP, S);
@@ -720,19 +783,23 @@ void attention_backward(struct Attention* att, float* dY, float* out_dWq, float*
 			float* dKh = dK + b * S * Hkv * Dh + hkv * Dh;	      // [S, Dh], ld=Hkv*Dh
 			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, S, Dh, S, a, dA, S, K, Hkv * Dh, 0.0f,
 				    dQh, Hq * Dh);
-			cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, S, Dh, S, a, dA, S, Q, Hq * Dh, 0.0f, dKh,
+			cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, S, Dh, S, a, dA, S, Q, Hq * Dh, 1.0f, dKh,
 				    Hkv * Dh);
 		}
 	}
+
+	debug_print_norm_n(dQ, "dQ", B * S * D);
+	debug_print_norm_n(dK, "dK", B * S * Dkv);
+	debug_print_norm_n(dV, "dV", B * S * Dkv);
 
 	rope1(rope, dQ, B, S, Hq, Dh, true);
 	rope1(rope, dK, B, S, Hkv, Dh, true);
 
 	// Wq...dX
 	float* X = att->ctx.X_in;
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, D, N, 1.0f, X, D, dQ, D, 0.0f, out_dWq, D);
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Dkv, N, 1.0f, X, D, dK, Dkv, 0.0f, out_dWk, Dkv);
-	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Dkv, N, 1.0f, X, D, dV, Dkv, 0.0f, out_dWv, Dkv);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, D, N, 1.0f, X, D, dQ, D, 1.0f, out_dWq, D);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Dkv, N, 1.0f, X, D, dK, Dkv, 1.0f, out_dWk, Dkv);
+	cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, D, Dkv, N, 1.0f, X, D, dV, Dkv, 1.0f, out_dWv, Dkv);
 	float *Wq = att->q.weight, *Wk = att->k.weight, *Wv = att->v.weight;
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, D, 1.0f, dQ, D, Wq, D, 0.0f, out_dX, D);
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, N, D, Dkv, 1.0f, dK, Dkv, Wk, Dkv, 1.0f, out_dX, D);
@@ -747,6 +814,7 @@ void attention_backward(struct Attention* att, float* dY, float* out_dWq, float*
 void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
 	Model* m = mr->model;
 	int B = mr->B, S = mr->S, D = mr->D, V = mr->V, L = mr->L, Df = mr->Df;
+	int Dkv = mr->Dkv;
 	int BS = B * S;
 	float* dX = malloc(B * S * D * sizeof(float));
 	float* dX_res = malloc(BS * D * sizeof(float));
@@ -761,11 +829,18 @@ void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
 	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, BS, D, V, 1.0f, dlogits, V, m->embedding.table, D, 0, dX,
 		    D);
 
+	debug_print_norm_n(dlogits, "dlogits", B * S * V);
+	debug_print_norm_n(m->embedding.table, "W_e", V * D);
+	debug_print_norm_n(dX, "dX = dlogits @ W_e", B * S * D);
+
 	// RMSNorm
 	// y = x / rms * w, x_hat = x / rms
 	//   => dw = dy * x_hat
 	//      dx = (1/rms) * (dy * w - x_hat / d * sum(dy * w * x_hat))
 	rmsnorm_backward(&mr->model->norm, dX, mr->grad.norm, dX, B * S);
+
+	debug_print_norm_n(mr->grad.norm, "grad norm", D);
+	debug_print_norm_n(dX, "dX after rms", B * S * D);
 
 	for (int l = L - 1; l >= 0; l--) {
 		struct Layer* layer = &mr->model->layers[l];
@@ -774,17 +849,29 @@ void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
 		struct FFN* ffn = &mr->model->layers[l].mlp;
 		memcpy(dX_res, dX, B * S * D * sizeof(float));
 		ffn_backward(ffn, dX, grad->gate, grad->up, grad->down, dX, BS, D, Df);
+		debug_print_norm_n(dX, "dX after ffn", B * S * D);
 		rmsnorm_backward(&layer->post_norm, dX, grad->post_norm, dX, B * S);
 		for (int i = 0; i < B * S * D; i++) {
 			dX[i] += dX_res[i];
 		}
+		debug_print_norm_n(grad->gate, "layer grad gate", D * Df);
+		debug_print_norm_n(grad->up, "layer grad up", D * Df);
+		debug_print_norm_n(grad->down, "layer grad down", D * Df);
+		debug_print_norm_n(grad->post_norm, "layer grad post_norm", D);
 
 		memcpy(dX_res, dX, B * S * D * sizeof(float));
+		debug_print_norm_n(dX, "dX before att", B * S * D);
 		attention_backward(&layer->attention, dX, grad->Wq, grad->Wk, grad->Wv, grad->Wo, dX, &mr->rope);
+		debug_print_norm_n(dX, "dX after attention", B * S * D);
 		rmsnorm_backward(&layer->norm, dX, grad->norm, dX, B * S);
 		for (int i = 0; i < B * S * D; i++) {
 			dX[i] += dX_res[i];
 		}
+		debug_print_norm_n(grad->Wq, "layer grad w_q", D * D);
+		debug_print_norm_n(grad->Wk, "layer grad w_k", D * Dkv);
+		debug_print_norm_n(grad->Wv, "layer grad w_v", D * Dkv);
+		debug_print_norm_n(grad->Wo, "layer grad w_o", D * D);
+		debug_print_norm_n(grad->norm, "layer grad norm", D);
 	}
 
 	for (int i = 0; i < B * S; i++) {
@@ -796,6 +883,7 @@ void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
 			dvector[d] += dtoken[d];
 		}
 	}
+	debug_print_norm_n(mr->grad.embed, "grad embed", V * D);
 
 	free(dX);
 	free(dX_res);
@@ -804,7 +892,6 @@ void model_backward(ModelRunner* mr, const int* inputs, float* dlogits) {
 // logits: [B, S, v]
 // labels: [B, S]
 float criterion(float* logits, int* labels, int B, int S, int V, float* grad) {
-	printf("criterion\n");
 	float loss = 0.0f;
 	int count = 0;
 

@@ -107,6 +107,6 @@ Scheduler cosine_scheduler(int total_steps, float* lr) {
 }
 
 void scheduler_step(Scheduler* s) {
-	*s->lr = linear_cosine_schedule(s->step, s->total_steps, s->warmup_steps, s->start_lr, s->peak_lr, s->end_lr);
 	s->step++;
+	*s->lr = linear_cosine_schedule(s->step, s->total_steps, s->warmup_steps, s->start_lr, s->peak_lr, s->end_lr);
 }

@@ -1,16 +1,50 @@
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <time.h>
 
-#include "config.h"
-#include "data.h"
-#include "optimize.h"
-#include "qwen25.h"
-#include "tokenizer.h"
+#include "../src/config.h"
+#include "../src/data.h"
+#include "../src/optimize.h"
+#include "../src/qwen25.h"
 
-void train_model() {
+// void export_bin(const void* data, size_t n, size_t size, const char* filename) {
+// 	FILE* fp = fopen(filename, "wb");
+// 	if (!fp) return;
+// 	fwrite(data, size, n, fp);
+// 	fclose(fp);
+// }
+//
+// float forward_loss(ModelRunner* runner, int* inputs, int* labels) {
+// 	float* logits = model_forward(runner, inputs, false);
+// 	float loss = criterion(logits, labels, runner->B, runner->S, runner->V, NULL);
+// 	free(logits);
+// 	return loss;
+// }
+//
+// void test_grad(float* th, float grad_analytic, ModelRunner* runner, int* inputs, int* labels) {
+// 	float eps = 1e-5f;
+// 	float origin = *th;
+// 	*th = origin + eps;
+// 	float loss_plus = forward_loss(runner, inputs, labels);
+// 	*th = origin - eps;
+// 	float loss_minus = forward_loss(runner, inputs, labels);
+// 	*th = origin;
+// 	float grad_numeric = (loss_plus - loss_minus) / (2 * eps);
+// 	float diff = fabsf(grad_analytic - grad_numeric) / (fabsf(grad_analytic) + fabsf(grad_numeric) + 1e-8f);
+// 	if (diff > 1e-4) {
+// 		printf("not done 😈\ndiff = %.4f\n", diff);
+// 	}
+// }
+//
+// void test_grad_line(float* th, const float* grad, int count, ModelRunner* runner, int* inputs, int* labels) {
+// 	for (int i = 0; i < count; i++) {
+// 		test_grad(th + i, grad[i], runner, inputs, labels);
+// 	}
+// }
+
+int main() {
 	ModelConfig* config = calloc(1, sizeof(ModelConfig));
 	*config = (ModelConfig){
 	    .vocab_size = 151936,
@@ -26,15 +60,15 @@ void train_model() {
 	const int batch_size = 1;    // 32
 	const int max_seq_len = 32;  // 256
 	const int pad_id = -100;
-	const int num_epochs = 2000;
+	const int num_epochs = 1000;
 
 	Dataset* dataset = new_dataset("./data/tokens.bin", config->eos_token_id);
 	// dataset->count = 1,000,000
 	dataset->count *= 0.001 * 0.01 * 0.2;
 	// Dataset* train_set = dataset_split(dataset, 0, dataset->count * 0.8);
 	// Dataset* val_set = dataset_split(dataset, dataset->count * 0.8, dataset->count);
-	Dataset* train_set = dataset_split(dataset, 0, dataset->count * 0.5);
-	Dataset* val_set = dataset_split(dataset, dataset->count * 0.5, dataset->count);
+	Dataset* train_set = dataset_split(dataset, 0, dataset->count * 0.5);		  // 1
+	Dataset* val_set = dataset_split(dataset, dataset->count * 0.5, dataset->count);  // 1
 	DataLoader* train_loader = new_dataloader(train_set, batch_size, max_seq_len, pad_id, true);
 	DataLoader* val_loader = new_dataloader(val_set, batch_size, max_seq_len, pad_id, false);
 
@@ -45,8 +79,9 @@ void train_model() {
 	// Scheduler scheduler = cosine_scheduler(num_epochs * train_loader->num_batch, &optimizer->lr);
 	AdamW* optimizer = new_optimizer(runner, 1e-3);
 
+	float train_loss = 0.0f;
 	for (int epoch = 1; epoch <= num_epochs; epoch++) {
-		float train_loss = 0.0f;
+		train_loss = 0.0f;
 		float val_loss = 0.0f;
 
 		for (int batch = 0; batch < train_loader->num_batch; batch++) {
@@ -85,8 +120,6 @@ void train_model() {
 		       train_loss, val_loss, optimizer->lr);
 	}
 
-	// TODO: export model.parameters
-
 	free_optimizer(optimizer);
 	free_dataloader(train_loader);
 	free_dataloader(val_loader);
@@ -96,93 +129,11 @@ void train_model() {
 	free_modelrunner(runner);
 	free_model(model);
 	free(config);
-}
 
-void load_infer(char* s);
-
-int main(int argc, char* argv[]) {
-	srand((unsigned)time(NULL));
-
-	if (argc < 2) {
-		printf("\nUsage:\n\n");
-		printf("\twen run [input]\n");
-		printf("\twen train\n");
-		return -1;
-	}
-
-	if (strcmp(argv[1], "run") == 0) {
-		if (argc < 3) {
-			load_infer(NULL);
-		} else {
-			load_infer(argv[2]);
-		}
-	} else if (strcmp(argv[1], "train") == 0) {
-		train_model();
-	} else {
-		printf("unknown command: %s\n", argv[1]);
-		return -1;
+	if (train_loss > 0.01f) {
+		printf("train loss = %e > 0.01, you fail😈\n", train_loss);
+		exit(1);
 	}
 
 	return 0;
-}
-
-#define MODEL "./Qwen2.5-0.5B"
-
-void load_infer(char* s) {
-	Tokenizer t = new_tokenizer(MODEL "/vocab.json", MODEL "/merges.txt");
-
-	if (s == NULL) {
-		s = u8"The last man on Earth sat alone in a room.";
-	}
-
-	int n;
-	int* tokens = tokenize(t, s, &n);
-	printf("tokens: [ ");
-	for (int i = 0; i < n; i++) {
-		printf("%d", tokens[i]);
-		if (i != n - 1) {
-			printf(", ");
-		}
-	}
-	printf(" ]\n");
-	printf("\x1B[1;32m%s\x1B[0m", s);
-	fflush(stdout);
-
-	// ModelConfig* config = read_config(MODEL "/config.json");
-	// void* model = new_model(config, MODEL "/model.safetensors");
-	//
-	// int outputs[4];
-	// int outputs_i = 0;
-	// while (1) {
-	// 	// printf("\r %d / %d", i, 16);
-	// 	int token = inference(model, tokens, n);
-	// 	if (token == config->eos_token_id) {
-	// 		printf("<|eos|>");
-	// 		break;
-	// 	}
-	//
-	// 	outputs[outputs_i] = token;
-	// 	outputs_i++;
-	//
-	// 	while (outputs_i > 0) {
-	// 		const char* output = decode_stream(t, outputs, &outputs_i);
-	// 		if (output) {
-	// 			printf("%s", output);
-	// 		}
-	// 	}
-	// 	fflush(stdout);
-	//
-	// 	n++;
-	// 	tokens = realloc(tokens, n * sizeof(int));
-	// 	tokens[n - 1] = token;
-	// 	if (n >= 4096) {
-	// 		break;
-	// 	}
-	// }
-	//
-	// printf("\n");
-	// free_model(model);
-	// free(config);
-	free(tokens);
-	free_tokenizer(t);
 }
